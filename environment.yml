@@ -1,0 +1,26 @@
+name: gsplat-metal
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.13
+  - jupyter
+  - conda-forge::ninja
+  - conda-forge::numpy
+  - conda-forge::rich>=12
+  - conda-forge::jaxtyping
+  - conda-forge::pytest
+  - conda-forge::pytest-env
+  - conda-forge::setuptools
+  - conda-forge::wheel
+  - pip:
+      - torch==2.11.*
+      - black[jupyter]==22.3.0
+      - isort==5.10.1
+      - pylint==2.13.4
+      - pytest-xdist==2.5.0
+      - typeguard>=2.13.3
+      - pyyaml>=6.0.1
+      - build
+      - twine
+      - imageio>=2.37.2

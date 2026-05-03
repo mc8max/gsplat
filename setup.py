@@ -20,6 +20,7 @@ import os.path as osp
 import pathlib
 import platform
 import sys
+import importlib.util
 
 from setuptools import find_packages, setup
 
@@ -29,6 +30,7 @@ exec(open("gsplat/version.py", "r").read())
 URL = "https://github.com/nerfstudio-project/gsplat"
 
 BUILD_NO_CUDA = os.getenv("BUILD_NO_CUDA", "0") == "1"
+BUILD_METAL = os.getenv("BUILD_METAL", "1" if sys.platform == "darwin" else "0") == "1"
 
 
 def get_ext():
@@ -45,8 +47,6 @@ def get_extensions():
     # dependency where gsplat is imported before it is built. To avoid
     # this, we sidestep the traditional Python import mechanism and construct
     # the module directly from build.py.
-    import importlib.util
-
     spec = importlib.util.spec_from_file_location(
         "gsplat_cuda_build", os.path.join("gsplat", "cuda", "build.py")
     )
@@ -68,6 +68,36 @@ def get_extensions():
         extra_link_args=params.extra_ldflags,
     )
     return [extension]
+
+
+def get_metal_extensions():
+    from torch.utils.cpp_extension import CppExtension
+
+    spec = importlib.util.spec_from_file_location(
+        "gsplat_metal_build", os.path.join("gsplat", "metal", "build.py")
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    module.compile_metallib()
+    params = module.get_build_parameters()
+    setup_dir = os.path.dirname(os.path.abspath(__file__))
+    sources = [os.path.relpath(s, setup_dir) for s in params.sources]
+
+    extension = CppExtension(
+        params.name,
+        sources=sources,
+        include_dirs=params.include_dirs,
+        extra_compile_args={"cxx": params.extra_cflags},
+        extra_link_args=params.extra_ldflags,
+    )
+    return [extension]
+
+
+ext_modules = []
+if not BUILD_NO_CUDA:
+    ext_modules.extend(get_extensions())
+if BUILD_METAL:
+    ext_modules.extend(get_metal_extensions())
 
 
 setup(
@@ -110,9 +140,10 @@ setup(
             "torchpq>=0.3.0.6",
         ],
     },
-    ext_modules=get_extensions() if not BUILD_NO_CUDA else [],
-    cmdclass={"build_ext": get_ext()} if not BUILD_NO_CUDA else {},
+    ext_modules=ext_modules,
+    cmdclass={"build_ext": get_ext()} if ext_modules else {},
     packages=find_packages(),
+    package_data={"gsplat.metal": ["*.metallib"]},
     # https://github.com/pypa/setuptools/issues/1461#issuecomment-954725244
     include_package_data=True,
 )

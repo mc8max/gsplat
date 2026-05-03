@@ -1,4 +1,5 @@
 .clangd
+**/.clang-module-cache/
 compile_commands.json
 
 # Visual Studio Code configs.
@@ -125,3 +126,7 @@ data
 results
 
 !examples/benchmarks/compression/results/
+
+local/
+*.metallib
+*.air

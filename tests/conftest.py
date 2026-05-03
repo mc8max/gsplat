@@ -83,3 +83,10 @@ def dist_init():
 
     if torch.distributed.is_initialized():
         torch.distributed.destroy_process_group()
+
+
+@pytest.fixture(scope="session")
+def mps_device():
+    if not torch.backends.mps.is_available():
+        pytest.skip("MPS not available")
+    return torch.device("mps")

@@ -1,3 +1,7 @@
 recursive-include gsplat/cuda/csrc *
 recursive-include gsplat/cuda/include *
 include gsplat/cuda/ext.cpp
+recursive-include gsplat/metal/csrc *
+recursive-include gsplat/metal/include *
+include gsplat/metal/ext.mm
+include gsplat/metal/*.metallib
