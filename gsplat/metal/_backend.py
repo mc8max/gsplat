@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import os
 import sys
+import warnings
 
 import torch
 
@@ -17,6 +18,8 @@ def load() -> bool:
     global _loaded, _metal_C
     if _loaded:
         return _metal_C is not None
+    
+    _loaded = True
 
     if sys.platform != "darwin":
         return False
@@ -30,15 +33,17 @@ def load() -> bool:
 
     metallib = os.path.join(os.path.dirname(__file__), "gsplat_metal.metallib")
     if not os.path.exists(metallib):
-        raise FileNotFoundError(
-            f"gsplat Metal library not found at {metallib}. "
-            "Re-run: BUILD_NO_CUDA=1 pip install -e . --no-build-isolation"
-        )
+        warnings.warn(f"Unable to find lib file of gsplat_metal.metallib at {metallib}.")
+        return False
 
-    _C.load_library(metallib)
-    _metal_C = _C
-    _loaded = True
-    return True
+    try:
+        _C.load_library(metallib)
+        _metal_C = _C
+        return True
+    except Exception as e:
+        warnings.warn(f"Unable to load gsplat_metal.metallib at {metallib}: {e}")
+
+    return False
 
 
 def has_metal() -> bool:
