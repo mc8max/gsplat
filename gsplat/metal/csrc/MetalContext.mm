@@ -20,6 +20,8 @@ MetalContext& MetalContext::instance() {
 }
 
 void MetalContext::load_library(const std::string& metallib_path) {
+    std::lock_guard<std::mutex> lock(mutex_);
+
     NSString* path = [NSString stringWithUTF8String:metallib_path.c_str()];
     NSError* error = nil;
     library_ = [device_ newLibraryWithFile:path error:&error];
@@ -33,6 +35,8 @@ void MetalContext::load_library(const std::string& metallib_path) {
 }
 
 id<MTLComputePipelineState> MetalContext::pipeline(const std::string& function_name) {
+    std::lock_guard<std::mutex> lock(mutex_);
+
     TORCH_CHECK(library_ != nil, "Metal library not loaded");
 
     NSString* key = [NSString stringWithUTF8String:function_name.c_str()];

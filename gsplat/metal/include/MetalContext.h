@@ -6,6 +6,7 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
+#include <mutex>
 #include <string>
 
 namespace gsplat::metal {
@@ -24,6 +25,7 @@ public:
 private:
     MetalContext();
 
+    std::mutex mutex_;
     id<MTLDevice> device_ = nil;
     id<MTLLibrary> library_ = nil;
     NSMutableDictionary<NSString*, id<MTLComputePipelineState>>* pipelines_ = nil;
