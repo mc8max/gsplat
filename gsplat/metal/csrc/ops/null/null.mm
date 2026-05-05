@@ -51,7 +51,7 @@ at::Tensor null_op(const at::Tensor& input) {
               threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
         }
     });
-    mps_stream->synchronize(at::mps::SyncType::COMMIT_AND_WAIT);
+    mps_stream->synchronize(at::mps::SyncType::COMMIT);
 
     return output;
 }
