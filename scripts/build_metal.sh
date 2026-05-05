@@ -10,8 +10,14 @@ MODE="${1:-release}"
 
 mkdir -p "$MODULE_CACHE_DIR"
 
+mapfile -t METAL_FILES < <(find "$SRC_DIR/ops" -type f -name "*.metal" | sort)
+if [[ ${#METAL_FILES[@]} -eq 0 ]]; then
+    echo "No .metal files found under $SRC_DIR/ops" >&2
+    exit 1
+fi
+
 AIR_FILES=()
-for metal_file in "$SRC_DIR"/ops/*/*.metal; do
+for metal_file in "${METAL_FILES[@]}"; do
     air="${metal_file%.metal}.air"
     echo "Compiling $metal_file -> $air"
     args=(-sdk "$METAL_SDK" metal "-fmodules-cache-path=$MODULE_CACHE_DIR" -c "$metal_file" -o "$air")
