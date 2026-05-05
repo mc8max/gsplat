@@ -15,12 +15,13 @@
 # limitations under the License.
 
 import glob
+import importlib.util
 import os
 import os.path as osp
 import pathlib
 import platform
+import shutil
 import sys
-import importlib.util
 
 from setuptools import find_packages, setup
 
@@ -72,6 +73,12 @@ def get_extensions():
 
 def get_metal_extensions():
     from torch.utils.cpp_extension import CppExtension
+
+    if shutil.which("xcrun") is None:
+        raise EnvironmentError(
+            "xcrun not found. Install Xcode Command Line Tools: "
+            "xcode-select --install"
+        )
 
     spec = importlib.util.spec_from_file_location(
         "gsplat_metal_build", os.path.join("gsplat", "metal", "build.py")

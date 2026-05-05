@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import glob
 import os
+import shutil
 import subprocess
 from types import SimpleNamespace
 
@@ -12,8 +13,17 @@ PATH = os.path.dirname(os.path.abspath(__file__))
 MODULE_CACHE_PATH = os.path.join(PATH, ".clang-module-cache")
 
 
+def ensure_xcrun_available() -> None:
+    if shutil.which("xcrun") is None:
+        raise EnvironmentError(
+            "xcrun not found. Install Xcode Command Line Tools: "
+            "xcode-select --install"
+        )
+
+
 def compile_metallib(mode: str = "release") -> str:
     """Compile all Metal kernels into a single metallib."""
+    ensure_xcrun_available()
     os.makedirs(MODULE_CACHE_PATH, exist_ok=True)
     metal_files = sorted(
         glob.glob(os.path.join(PATH, "csrc", "ops", "**", "*.metal"), recursive=True)
