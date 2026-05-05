@@ -6,7 +6,6 @@
 #import <Metal/Metal.h>
 
 #include <torch/extension.h>
-#include <ATen/native/mps/OperationUtils.h>
 
 namespace gsplat::metal {
 
@@ -19,7 +18,7 @@ inline void check_mps_float32(const at::Tensor& t, const char* name) {
 
 inline id<MTLBuffer> to_mtl_buffer(const at::Tensor& t) {
     TORCH_CHECK(t.is_mps(), "Expected MPS tensor");
-    return at::native::mps::getMTLBufferStorage(t);
+    return (__bridge id<MTLBuffer>)(t.storage().data_ptr().get());
 }
 
 inline NSUInteger byte_offset(const at::Tensor& t) {

@@ -3,13 +3,12 @@
 
 #include "MetalContext.h"
 
-#include <ATen/mps/MPSDevice.h>
 #include <torch/extension.h>
 
 namespace gsplat::metal {
 
 MetalContext::MetalContext() {
-    device_ = at::mps::MPSDevice::getInstance()->device();
+    device_ = MTLCreateSystemDefaultDevice();
     TORCH_CHECK(device_ != nil, "Failed to create Metal device");
     pipelines_ = [[NSMutableDictionary alloc] init];
 }
