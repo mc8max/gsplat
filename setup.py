@@ -31,7 +31,8 @@ exec(open("gsplat/version.py", "r").read())
 URL = "https://github.com/nerfstudio-project/gsplat"
 
 BUILD_NO_CUDA = os.getenv("BUILD_NO_CUDA", "0") == "1"
-BUILD_METAL = os.getenv("BUILD_METAL", "1" if sys.platform == "darwin" else "0") == "1"
+_is_apple_silicon = sys.platform == "darwin" and platform.machine() == "arm64"
+BUILD_METAL = os.getenv("BUILD_METAL", "1" if _is_apple_silicon else "0") == "1"
 
 
 def get_ext():
