@@ -7,6 +7,7 @@ import glob
 import os
 import shutil
 import subprocess
+import tempfile
 from types import SimpleNamespace
 
 PATH = os.path.dirname(os.path.abspath(__file__))
@@ -31,30 +32,31 @@ def compile_metallib(mode: str = "release") -> str:
     if not metal_files:
         raise FileNotFoundError("No .metal files found under gsplat/metal/csrc/ops")
 
-    air_files = []
-    for metal_file in metal_files:
-        air_file = metal_file[:-6] + ".air"
-        cmd = [
-            "xcrun",
-            "-sdk",
-            "macosx",
-            "metal",
-            "-fmodules-cache-path=" + MODULE_CACHE_PATH,
-            "-c",
-            metal_file,
-            "-o",
-            air_file,
-        ]
-        if mode == "debug":
-            cmd.extend(["-gline-tables-only", "-frecord-sources"])
-        subprocess.run(cmd, check=True)
-        air_files.append(air_file)
-
     output = os.path.join(PATH, "gsplat_metal.metallib")
-    subprocess.run(
-        ["xcrun", "-sdk", "macosx", "metallib", *air_files, "-o", output],
-        check=True,
-    )
+    with tempfile.TemporaryDirectory() as tmpdir:
+        air_files = []
+        for metal_file in metal_files:
+            air_file = os.path.join(tmpdir, os.path.basename(metal_file)[:-6] + ".air")
+            cmd = [
+                "xcrun",
+                "-sdk",
+                "macosx",
+                "metal",
+                "-fmodules-cache-path=" + MODULE_CACHE_PATH,
+                "-c",
+                metal_file,
+                "-o",
+                air_file,
+            ]
+            if mode == "debug":
+                cmd.extend(["-gline-tables-only", "-frecord-sources"])
+            subprocess.run(cmd, check=True)
+            air_files.append(air_file)
+
+        subprocess.run(
+            ["xcrun", "-sdk", "macosx", "metallib", *air_files, "-o", output],
+            check=True,
+        )
     return output
 
 

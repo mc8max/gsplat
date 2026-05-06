@@ -47,6 +47,8 @@ def setup_test_environment():
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
         torch.cuda.empty_cache()
+    if torch.backends.mps.is_available():
+        torch.mps.empty_cache()
 
     # Run garbage collection
     gc.collect()
@@ -57,6 +59,8 @@ def setup_test_environment():
     # Optional: cleanup after test
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+    if torch.backends.mps.is_available():
+        torch.mps.empty_cache()
     gc.collect()
 
 

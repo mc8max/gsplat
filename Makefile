@@ -11,6 +11,11 @@ build-metal:
 metallib:
 	bash scripts/build_metal.sh
 
+# *.metallib is excluded from git. Run `make metallib` before `make sdist`
+# so the compiled library is present for MANIFEST.in to pick up.
+sdist: metallib
+	python -m build --sdist
+
 test-metal:
 	pytest tests/metal/ -v
 

@@ -23,7 +23,7 @@ def test_null_identity(mps_device):
 
 
 def test_null_via_torch_ops(mps_device):
-    gm.has_metal()
+    assert gm.has_metal()
     x = torch.randn(512, device=mps_device)
     y = torch.ops.gsplat.metal_null(x)
     torch.testing.assert_close(y.cpu(), x.cpu())
