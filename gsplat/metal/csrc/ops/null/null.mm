@@ -43,8 +43,6 @@ at::Tensor null_op(const at::Tensor& input) {
             [enc setBuffer:to_mtl_buffer(input) offset:byte_offset(input) atIndex:0];
             [enc setBuffer:to_mtl_buffer(output) offset:byte_offset(output) atIndex:1];
             [enc setBytes:&n length:sizeof(n) atIndex:2];
-            [enc useResource:to_mtl_buffer(input) usage:MTLResourceUsageRead];
-            [enc useResource:to_mtl_buffer(output) usage:MTLResourceUsageWrite];
 
             const uint32_t tg = static_cast<uint32_t>(pso.maxTotalThreadsPerThreadgroup);
             const uint32_t threads = std::min(tg, n);
