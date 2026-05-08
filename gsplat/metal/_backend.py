@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+"""Helpers for loading the compiled gsplat Metal extension."""
+
 from __future__ import annotations
 
 import os
@@ -16,13 +18,14 @@ _lock = threading.Lock()
 
 
 def load() -> bool:
-    """Load the compiled Metal extension and bundled metallib."""
+    """Load the compiled Metal extension and bundled ``.metallib`` asset."""
+
     global _loaded, _metal_C
-    
+
     with _lock:
         if _loaded:
             return _metal_C is not None
-        
+
         _loaded = True
 
         if sys.platform != "darwin":
@@ -51,4 +54,6 @@ def load() -> bool:
 
 
 def has_metal() -> bool:
+    """Return ``True`` when the gsplat Metal extension can be loaded."""
+
     return load()

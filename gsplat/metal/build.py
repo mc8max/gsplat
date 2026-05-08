@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+"""Build helpers for the gsplat Metal extension and kernel library."""
+
 from __future__ import annotations
 
 import glob
@@ -15,6 +17,8 @@ MODULE_CACHE_PATH = os.path.join(PATH, ".clang-module-cache")
 
 
 def ensure_xcrun_available() -> None:
+    """Fail fast when Apple command-line tooling is not available."""
+
     if shutil.which("xcrun") is None:
         raise EnvironmentError(
             "xcrun not found. Install Xcode Command Line Tools: "
@@ -23,7 +27,8 @@ def ensure_xcrun_available() -> None:
 
 
 def compile_metallib(mode: str = "release") -> str:
-    """Compile all Metal kernels into a single metallib."""
+    """Compile all Metal kernels into the bundled ``gsplat_metal.metallib``."""
+
     ensure_xcrun_available()
     os.makedirs(MODULE_CACHE_PATH, exist_ok=True)
     metal_files = sorted(
@@ -61,6 +66,8 @@ def compile_metallib(mode: str = "release") -> str:
 
 
 def get_build_parameters() -> SimpleNamespace:
+    """Return setuptools extension parameters for the Metal bridge module."""
+
     sources = sorted(
         glob.glob(os.path.join(PATH, "csrc", "**", "*.mm"), recursive=True)
     ) + [os.path.join(PATH, "ext.mm")]
