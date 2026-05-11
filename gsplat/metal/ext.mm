@@ -4,7 +4,7 @@
 #include <torch/extension.h>
 
 #include "MetalContext.h"
-#include "ops/null/null.h"
+#include "ops/null.h"
 #include "ops/quat_scale_to_covar_preci.h"
 #include "ops/spherical_harmonics.h"
 
