@@ -188,3 +188,32 @@ inline float eval_bivariate_poly_metal(
     }
     return result;
 }
+
+// Distort one ray using the bivariate windshield model. The horizontal and
+// vertical polynomials are evaluated in the same way as the CUDA and Python
+// references, then remapped to a unit-length direction.
+inline float3 distort_camera_ray_metal(
+    float3 ray,
+    device const float* h_poly,
+    device const float* v_poly,
+    uint h_order,
+    uint v_order
+) {
+    float ray_length = length(ray);
+    if (ray_length < 1e-6f) {
+        return ray;
+    }
+
+    float phi = asin(clamp(ray.x / ray_length, -1.0f, 1.0f));
+    float theta = asin(clamp(ray.y / ray_length, -1.0f, 1.0f));
+
+    float x = sin(eval_bivariate_poly_metal(h_poly, h_order, phi, theta));
+    float y = sin(eval_bivariate_poly_metal(v_poly, v_order, phi, theta));
+
+    float val = clamp(x * x + y * y, 0.0f, 1.0f);
+    float z = sqrt(1.0f - val);
+    if (ray.z < 0.0f) {
+        z = -z;
+    }
+    return float3(x, y, z);
+}

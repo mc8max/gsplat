@@ -54,6 +54,30 @@ def eval_bivariate_poly(
     )
 
 
+def distort_camera_rays(
+    rays: torch.Tensor,
+    h_poly: torch.Tensor,
+    v_poly: torch.Tensor,
+    h_inv_poly: torch.Tensor,
+    v_inv_poly: torch.Tensor,
+    reference_poly: int,
+    inverse: bool = False,
+) -> torch.Tensor:
+    """Distort rays using the external-distortion bivariate windshield model on MPS."""
+
+    if rays.shape[-1] != 3:
+        raise ValueError(f"rays last dimension must be 3, got {rays.shape[-1]}")
+    return _make_lazy_metal_func("metal_distort_camera_rays")(
+        rays.contiguous(),
+        h_poly.contiguous(),
+        v_poly.contiguous(),
+        h_inv_poly.contiguous(),
+        v_inv_poly.contiguous(),
+        reference_poly,
+        inverse,
+    )
+
+
 class _QuatScaleToCovarPreci(torch.autograd.Function):
     """Autograd bridge for the Metal quat-scale-to-covariance/precision op."""
     

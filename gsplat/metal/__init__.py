@@ -5,6 +5,7 @@
 
 from ._backend import has_metal
 from ._wrapper import (
+    distort_camera_rays,
     eval_bivariate_poly,
     metal_null,
     quat_scale_to_covar_preci,
@@ -12,6 +13,7 @@ from ._wrapper import (
 )
 
 __all__ = [
+    "distort_camera_rays",
     "eval_bivariate_poly",
     "has_metal",
     "metal_null",
