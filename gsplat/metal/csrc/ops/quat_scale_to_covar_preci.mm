@@ -42,18 +42,6 @@ at::DimVector output_shape(const at::Tensor& quats, bool triu) {
     return shape;
 }
 
-void set_optional_tensor_buffer(
-    id<MTLComputeCommandEncoder> enc,
-    const at::Tensor& tensor,
-    NSUInteger index
-) {
-    if (tensor.defined()) {
-        [enc setBuffer:to_mtl_buffer(tensor) offset:byte_offset(tensor) atIndex:index];
-    } else {
-        [enc setBuffer:nil offset:0 atIndex:index];
-    }
-}
-
 void check_optional_grad(
     const c10::optional<at::Tensor>& grad,
     const char* name,

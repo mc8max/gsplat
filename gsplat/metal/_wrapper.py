@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+from typing import Optional
+
 import torch
 
 from ._backend import load
@@ -62,6 +64,48 @@ class _QuatScaleToCovarPreci(torch.autograd.Function):
         return v_quats, v_scales, None, None, None
 
 
+class _SphericalHarmonics(torch.autograd.Function):
+    """Autograd bridge for the Metal spherical harmonics op."""
+
+    @staticmethod
+    def forward(ctx, sh_degree, dirs, coeffs, masks):
+        """Run the forward Metal kernel and stash inputs for backward."""
+
+        ctx.set_materialize_grads(False)
+        colors = _make_lazy_metal_func("metal_spherical_harmonics_fwd")(
+            sh_degree, dirs, coeffs, masks
+        )
+        # save_for_backward requires tensors; use an empty bool tensor as a
+        # None sentinel since save_for_backward does not accept None directly.
+        ctx.save_for_backward(
+            dirs,
+            coeffs,
+            masks if masks is not None else torch.empty(0, device=dirs.device, dtype=torch.bool),
+        )
+        ctx.sh_degree = sh_degree
+        ctx.has_masks = masks is not None
+        return colors
+
+    @staticmethod
+    def backward(ctx, v_colors):
+        """Propagate gradients through the Metal backward kernel."""
+
+        if v_colors is None:
+            return None, None, None, None
+        dirs, coeffs, masks = ctx.saved_tensors
+        masks = masks if ctx.has_masks else None
+        compute_v_dirs = ctx.needs_input_grad[1]
+        v_coeffs, v_dirs = _make_lazy_metal_func("metal_spherical_harmonics_bwd")(
+            ctx.sh_degree,
+            dirs,
+            coeffs,
+            masks,
+            v_colors.contiguous(),
+            compute_v_dirs,
+        )
+        return None, v_dirs, v_coeffs, None
+
+
 def quat_scale_to_covar_preci(
     quats: torch.Tensor,
     scales: torch.Tensor,
@@ -97,3 +141,40 @@ def quat_scale_to_covar_preci(
         triu,
     )
     return covars if compute_covar else None, precis if compute_preci else None
+
+
+def spherical_harmonics(
+    degrees_to_use: int,
+    dirs: torch.Tensor,
+    coeffs: torch.Tensor,
+    masks: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Compute spherical harmonics colors from directions and SH coefficients."""
+
+    num_bases_needed = (degrees_to_use + 1) ** 2
+    if degrees_to_use < 0 or degrees_to_use > 4:
+        raise ValueError(f"degrees_to_use must be in [0, 4], got {degrees_to_use}")
+    if coeffs.shape[-2] < num_bases_needed:
+        raise ValueError(
+            f"coeffs must have at least {num_bases_needed} basis functions "
+            f"(degrees_to_use={degrees_to_use}), got {coeffs.shape[-2]}"
+        )
+    if dirs.shape[-1] != 3:
+        raise ValueError(f"dirs last dimension must be 3, got {dirs.shape[-1]}")
+    if coeffs.shape[-1] != 3:
+        raise ValueError(f"coeffs last dimension must be 3, got {coeffs.shape[-1]}")
+    if dirs.shape[:-1] != coeffs.shape[:-2]:
+        raise ValueError(
+            f"dirs and coeffs batch dimensions must match, got dirs {dirs.shape} "
+            f"and coeffs {coeffs.shape}"
+        )
+    if masks is not None and masks.shape != dirs.shape[:-1]:
+        raise ValueError(
+            f"masks shape must match batch dims {dirs.shape[:-1]}, got {masks.shape}"
+        )
+    return _SphericalHarmonics.apply(
+        degrees_to_use,
+        dirs.contiguous(),
+        coeffs.contiguous(),
+        masks.contiguous() if masks is not None else None,
+    )
