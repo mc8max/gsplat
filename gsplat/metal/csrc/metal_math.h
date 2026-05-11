@@ -161,3 +161,30 @@ inline void covar_from_RS_vjp(
     v_s.y += dot(R[1], v_M[1]);
     v_s.z += dot(R[2], v_M[2]);
 }
+
+// Evaluate the external-distortion bivariate polynomial using the same nested
+// Horner structure as the Python and CUDA references. The coefficient layout is
+// triangular, with rows of descending x-order evaluated first.
+inline float eval_bivariate_poly_metal(
+    device const float* poly_coeffs,
+    uint order,
+    float x,
+    float y
+) {
+    float outer_coeffs[6];
+    uint start_idx = 0u;
+    for (int inner_order = int(order); inner_order >= 0; --inner_order) {
+        float acc = 0.0f;
+        for (int idx = int(start_idx) + inner_order; idx >= int(start_idx); --idx) {
+            acc = acc * x + poly_coeffs[idx];
+        }
+        outer_coeffs[order - uint(inner_order)] = acc;
+        start_idx += uint(inner_order + 1);
+    }
+
+    float result = 0.0f;
+    for (int i = int(order); i >= 0; --i) {
+        result = result * y + outer_coeffs[i];
+    }
+    return result;
+}

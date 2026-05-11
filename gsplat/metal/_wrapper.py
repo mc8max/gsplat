@@ -28,6 +28,32 @@ def metal_null(x: torch.Tensor) -> torch.Tensor:
     return _make_lazy_metal_func("metal_null")(x)
 
 
+def eval_bivariate_poly(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    poly_coeffs: torch.Tensor,
+    order: int,
+) -> torch.Tensor:
+    """Evaluate the external-distortion bivariate polynomial on MPS."""
+
+    if x.shape != y.shape:
+        raise ValueError(f"x and y must have the same shape, got {x.shape} and {y.shape}")
+    if order < 0 or order > 5:
+        raise ValueError(f"order must be in [0, 5], got {order}")
+    expected = (order + 1) * (order + 2) // 2
+    if poly_coeffs.numel() != expected:
+        raise ValueError(
+            f"poly_coeffs must have {expected} coefficients for order {order}, "
+            f"got {poly_coeffs.numel()}"
+        )
+    return _make_lazy_metal_func("metal_eval_bivariate_poly")(
+        x.contiguous(),
+        y.contiguous(),
+        poly_coeffs.contiguous(),
+        order,
+    )
+
+
 class _QuatScaleToCovarPreci(torch.autograd.Function):
     """Autograd bridge for the Metal quat-scale-to-covariance/precision op."""
     

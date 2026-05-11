@@ -4,6 +4,17 @@
 """Public Python entry points for the gsplat Metal backend."""
 
 from ._backend import has_metal
-from ._wrapper import metal_null, quat_scale_to_covar_preci, spherical_harmonics
+from ._wrapper import (
+    eval_bivariate_poly,
+    metal_null,
+    quat_scale_to_covar_preci,
+    spherical_harmonics,
+)
 
-__all__ = ["has_metal", "metal_null", "quat_scale_to_covar_preci", "spherical_harmonics"]
+__all__ = [
+    "eval_bivariate_poly",
+    "has_metal",
+    "metal_null",
+    "quat_scale_to_covar_preci",
+    "spherical_harmonics",
+]

@@ -4,6 +4,7 @@
 #include <torch/extension.h>
 
 #include "MetalContext.h"
+#include "ops/eval_bivariate_poly.h"
 #include "ops/null.h"
 #include "ops/quat_scale_to_covar_preci.h"
 #include "ops/spherical_harmonics.h"
@@ -35,9 +36,14 @@ TORCH_LIBRARY_FRAGMENT(gsplat, m) {
         "int degrees_to_use, Tensor dirs, Tensor coeffs, Tensor? masks,"
         " Tensor v_colors, bool compute_v_dirs"
         ") -> (Tensor, Tensor?)");
+    m.def(
+        "metal_eval_bivariate_poly("
+        "Tensor x, Tensor y, Tensor poly_coeffs, int order"
+        ") -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(gsplat, MPS, m) {
+    m.impl("metal_eval_bivariate_poly", &eval_bivariate_poly_op);
     m.impl("metal_null", &null_op);
     m.impl(
         "metal_quat_scale_to_covar_preci_fwd",
