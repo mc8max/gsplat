@@ -6,6 +6,7 @@
 #include "MetalContext.h"
 #include "ops/external_distortion.h"
 #include "ops/null.h"
+#include "ops/projection_ewa_simple.h"
 #include "ops/quat_scale_to_covar_preci.h"
 #include "ops/spherical_harmonics.h"
 
@@ -45,11 +46,22 @@ TORCH_LIBRARY_FRAGMENT(gsplat, m) {
         "Tensor rays, Tensor h_poly, Tensor v_poly, Tensor h_inv_poly, "
         "Tensor v_inv_poly, int reference_poly, bool inverse"
         ") -> Tensor");
+    m.def(
+        "metal_projection_ewa_simple_fwd("
+        "Tensor means, Tensor covars, Tensor Ks, int width, int height, int camera_model"
+        ") -> (Tensor, Tensor)");
+    m.def(
+        "metal_projection_ewa_simple_bwd("
+        "Tensor means, Tensor covars, Tensor Ks, int width, int height, int camera_model, "
+        "Tensor v_means2d, Tensor v_covars2d"
+        ") -> (Tensor, Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(gsplat, MPS, m) {
     m.impl("metal_eval_bivariate_poly", &eval_bivariate_poly_op);
     m.impl("metal_distort_camera_rays", &distort_camera_rays_op);
+    m.impl("metal_projection_ewa_simple_fwd", &projection_ewa_simple_fwd_op);
+    m.impl("metal_projection_ewa_simple_bwd", &projection_ewa_simple_bwd_op);
     m.impl("metal_null", &null_op);
     m.impl(
         "metal_quat_scale_to_covar_preci_fwd",

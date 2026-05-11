@@ -78,6 +78,13 @@ def distort_camera_rays(
     )
 
 
+_CAMERA_MODEL_TO_INT = {
+    "pinhole": 0,
+    "ortho": 1,
+    "fisheye": 2,
+}
+
+
 class _QuatScaleToCovarPreci(torch.autograd.Function):
     """Autograd bridge for the Metal quat-scale-to-covariance/precision op."""
     
@@ -156,6 +163,51 @@ class _SphericalHarmonics(torch.autograd.Function):
         return None, v_dirs, v_coeffs, None
 
 
+class _ProjectionEWASimple(torch.autograd.Function):
+    """Autograd bridge for the Metal EWA projection op."""
+
+    @staticmethod
+    def forward(ctx, means, covars, Ks, width, height, camera_model="pinhole"):
+        if camera_model == "ftheta":
+            raise ValueError(
+                "ftheta camera is only supported via UT, please set with_ut=True in the rasterization()"
+            )
+        if camera_model not in _CAMERA_MODEL_TO_INT:
+            raise ValueError(
+                f"camera_model must be one of {tuple(_CAMERA_MODEL_TO_INT)}, got {camera_model}"
+            )
+
+        camera_model_type = _CAMERA_MODEL_TO_INT[camera_model]
+        means2d, covars2d = _make_lazy_metal_func("metal_projection_ewa_simple_fwd")(
+            means,
+            covars,
+            Ks,
+            width,
+            height,
+            camera_model_type,
+        )
+        ctx.save_for_backward(means, covars, Ks)
+        ctx.width = width
+        ctx.height = height
+        ctx.camera_model_type = camera_model_type
+        return means2d, covars2d
+
+    @staticmethod
+    def backward(ctx, v_means2d, v_covars2d):
+        means, covars, Ks = ctx.saved_tensors
+        v_means, v_covars = _make_lazy_metal_func("metal_projection_ewa_simple_bwd")(
+            means,
+            covars,
+            Ks,
+            ctx.width,
+            ctx.height,
+            ctx.camera_model_type,
+            v_means2d.contiguous(),
+            v_covars2d.contiguous(),
+        )
+        return v_means, v_covars, None, None, None, None
+
+
 def quat_scale_to_covar_preci(
     quats: torch.Tensor,
     scales: torch.Tensor,
@@ -227,4 +279,43 @@ def spherical_harmonics(
         dirs.contiguous(),
         coeffs.contiguous(),
         masks.contiguous() if masks is not None else None,
+    )
+
+
+def projection_ewa_simple(
+    means: torch.Tensor,
+    covars: torch.Tensor,
+    Ks: torch.Tensor,
+    width: int,
+    height: int,
+    camera_model: str = "pinhole",
+):
+    """Project camera-space 3D Gaussian means and covariances to 2D on MPS."""
+
+    if means.shape[-1] != 3:
+        raise ValueError(f"means last dimension must be 3, got {means.shape[-1]}")
+    if covars.shape[-2:] != (3, 3):
+        raise ValueError(f"covars last two dimensions must be (3, 3), got {covars.shape[-2:]}")
+    if Ks.shape[-2:] != (3, 3):
+        raise ValueError(f"Ks last two dimensions must be (3, 3), got {Ks.shape[-2:]}")
+    if means.shape[:-3] != covars.shape[:-4]:
+        raise ValueError(
+            f"means and covars batch dimensions must match, got {means.shape} and {covars.shape}"
+        )
+    if means.shape[:-3] != Ks.shape[:-3]:
+        raise ValueError(
+            f"means and Ks batch dimensions must match, got {means.shape} and {Ks.shape}"
+        )
+    if means.shape[-3] != covars.shape[-4] or means.shape[-3] != Ks.shape[-3]:
+        raise ValueError("camera dimension must match across means, covars, and Ks")
+    if means.shape[-2] != covars.shape[-3]:
+        raise ValueError("Gaussian dimension must match between means and covars")
+
+    return _ProjectionEWASimple.apply(
+        means.contiguous(),
+        covars.contiguous(),
+        Ks.contiguous(),
+        width,
+        height,
+        camera_model,
     )

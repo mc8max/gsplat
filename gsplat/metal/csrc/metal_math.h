@@ -217,3 +217,4 @@ inline float3 distort_camera_ray_metal(
     }
     return float3(x, y, z);
 }
+

@@ -8,6 +8,7 @@ from ._wrapper import (
     distort_camera_rays,
     eval_bivariate_poly,
     metal_null,
+    projection_ewa_simple,
     quat_scale_to_covar_preci,
     spherical_harmonics,
 )
@@ -17,6 +18,7 @@ __all__ = [
     "eval_bivariate_poly",
     "has_metal",
     "metal_null",
+    "projection_ewa_simple",
     "quat_scale_to_covar_preci",
     "spherical_harmonics",
 ]
