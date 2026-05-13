@@ -78,6 +78,32 @@ def distort_camera_rays(
     )
 
 
+def intersect_offset_encode(
+    isect_ids: torch.Tensor,
+    n_images: int,
+    tile_width: int,
+    tile_height: int,
+) -> torch.Tensor:
+    """Encode sorted intersection ids into dense per-tile start offsets on MPS."""
+
+    if isect_ids.dim() != 1:
+        raise ValueError(f"isect_ids must be 1D, got shape {tuple(isect_ids.shape)}")
+    if isect_ids.dtype != torch.int64:
+        raise ValueError(f"isect_ids must be int64, got {isect_ids.dtype}")
+    if n_images < 0:
+        raise ValueError(f"n_images must be non-negative, got {n_images}")
+    if tile_width <= 0:
+        raise ValueError(f"tile_width must be positive, got {tile_width}")
+    if tile_height <= 0:
+        raise ValueError(f"tile_height must be positive, got {tile_height}")
+    return _make_lazy_metal_func("metal_intersect_offset")(
+        isect_ids.contiguous(),
+        n_images,
+        tile_width,
+        tile_height,
+    )
+
+
 _CAMERA_MODEL_TO_INT = {
     "pinhole": 0,
     "ortho": 1,

@@ -7,6 +7,7 @@ from ._backend import has_metal
 from ._wrapper import (
     distort_camera_rays,
     eval_bivariate_poly,
+    intersect_offset_encode,
     metal_null,
     projection_ewa_simple,
     quat_scale_to_covar_preci,
@@ -17,6 +18,7 @@ __all__ = [
     "distort_camera_rays",
     "eval_bivariate_poly",
     "has_metal",
+    "intersect_offset_encode",
     "metal_null",
     "projection_ewa_simple",
     "quat_scale_to_covar_preci",

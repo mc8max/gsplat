@@ -5,6 +5,7 @@
 
 #include "MetalContext.h"
 #include "ops/external_distortion.h"
+#include "ops/intersect_offset.h"
 #include "ops/null.h"
 #include "ops/projection_ewa_simple.h"
 #include "ops/quat_scale_to_covar_preci.h"
@@ -55,11 +56,16 @@ TORCH_LIBRARY_FRAGMENT(gsplat, m) {
         "Tensor means, Tensor covars, Tensor Ks, int width, int height, int camera_model, "
         "Tensor v_means2d, Tensor v_covars2d"
         ") -> (Tensor, Tensor)");
+    m.def(
+        "metal_intersect_offset("
+        "Tensor isect_ids, int I, int tile_width, int tile_height"
+        ") -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(gsplat, MPS, m) {
     m.impl("metal_eval_bivariate_poly", &eval_bivariate_poly_op);
     m.impl("metal_distort_camera_rays", &distort_camera_rays_op);
+    m.impl("metal_intersect_offset", &intersect_offset_op);
     m.impl("metal_projection_ewa_simple_fwd", &projection_ewa_simple_fwd_op);
     m.impl("metal_projection_ewa_simple_bwd", &projection_ewa_simple_bwd_op);
     m.impl("metal_null", &null_op);
