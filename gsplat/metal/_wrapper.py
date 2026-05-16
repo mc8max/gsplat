@@ -5,12 +5,19 @@
 
 from __future__ import annotations
 
+import math
+from dataclasses import dataclass
 from typing import Optional
 
 import torch
 
 from ._backend import load
 
+
+@dataclass(frozen=True)
+class _IntersectTileInputs:
+    I: int
+    n_elements: int
 
 def _make_lazy_metal_func(name: str):
     """Return a callable that loads the Metal extension on first use."""
@@ -101,6 +108,265 @@ def intersect_offset_encode(
         n_images,
         tile_width,
         tile_height,
+    )
+
+
+def _prepare_intersect_tile_inputs(
+    means2d: torch.Tensor,
+    radii: torch.Tensor,
+    depths: torch.Tensor,
+    tile_size: int,
+    tile_width: int,
+    tile_height: int,
+    *,
+    packed: bool,
+    n_images: Optional[int],
+    image_ids: Optional[torch.Tensor],
+    gaussian_ids: Optional[torch.Tensor],
+    conics: Optional[torch.Tensor],
+    opacities: Optional[torch.Tensor],
+    segmented: bool,
+) -> _IntersectTileInputs:
+    if means2d.device.type != "mps":
+        raise ValueError(f"means2d must be on MPS, got {means2d.device}")
+    if radii.device != means2d.device or depths.device != means2d.device:
+        raise ValueError("means2d, radii, and depths must be on the same device")
+    if tile_size <= 0 or tile_width <= 0 or tile_height <= 0:
+        raise ValueError(
+            f"tile_size/tile_width/tile_height must be positive, got "
+            f"{tile_size}/{tile_width}/{tile_height}"
+        )
+    if segmented:
+        raise NotImplementedError("Metal intersect_tiles does not support segmented=True yet")
+    if conics is not None or opacities is not None:
+        raise NotImplementedError(
+            "Metal intersect_tiles currently supports only the AABB path. "
+            "Rejecting AccuTile inputs until conics/opacities parity is implemented."
+        )
+
+    if packed:
+        nnz = means2d.size(0)
+        if means2d.shape != (nnz, 2):
+            raise ValueError(f"packed means2d must have shape (nnz, 2), got {means2d.shape}")
+        if radii.shape != (nnz, 2):
+            raise ValueError(f"packed radii must have shape (nnz, 2), got {radii.shape}")
+        if depths.shape != (nnz,):
+            raise ValueError(f"packed depths must have shape (nnz,), got {depths.shape}")
+        if image_ids is None or gaussian_ids is None or n_images is None:
+            raise ValueError(
+                "image_ids, gaussian_ids, and n_images are required when packed=True"
+            )
+        if image_ids.shape != (nnz,):
+            raise ValueError(f"packed image_ids must have shape (nnz,), got {image_ids.shape}")
+        if gaussian_ids.shape != (nnz,):
+            raise ValueError(
+                f"packed gaussian_ids must have shape (nnz,), got {gaussian_ids.shape}"
+            )
+        if image_ids.device != means2d.device or gaussian_ids.device != means2d.device:
+            raise ValueError("image_ids and gaussian_ids must be on the same device as means2d")
+        if image_ids.dtype != torch.int64:
+            raise ValueError(f"image_ids must be int64, got {image_ids.dtype}")
+        if gaussian_ids.dtype != torch.int64:
+            raise ValueError(f"gaussian_ids must be int64, got {gaussian_ids.dtype}")
+        if n_images < 0:
+            raise ValueError(f"n_images must be non-negative, got {n_images}")
+        I = n_images
+        N = None
+        n_elements = nnz
+    else:
+        image_dims = means2d.shape[:-2]
+        N = means2d.shape[-2]
+        if radii.shape != image_dims + (N, 2):
+            raise ValueError(f"radii must have shape {image_dims + (N, 2)}, got {radii.shape}")
+        if depths.shape != image_dims + (N,):
+            raise ValueError(f"depths must have shape {image_dims + (N,)}, got {depths.shape}")
+        if image_ids is not None or gaussian_ids is not None:
+            raise ValueError("image_ids and gaussian_ids must be omitted when packed=False")
+        I = math.prod(image_dims)
+        n_elements = I * N
+
+    if depths.dtype != torch.float32:
+        raise ValueError(
+            f"Metal intersect_tiles currently requires float32 depths, got {depths.dtype}"
+        )
+    if means2d.dtype != torch.float32:
+        raise ValueError(
+            f"Metal intersect_tiles currently requires float32 means2d, got {means2d.dtype}"
+        )
+    if radii.dtype != torch.int32:
+        raise ValueError(
+            f"Metal intersect_tiles currently requires int32 radii, got {radii.dtype}"
+        )
+
+    return _IntersectTileInputs(
+        I=I,
+        n_elements=n_elements,
+    )
+
+def intersect_tile_count(
+    means2d: torch.Tensor,
+    radii: torch.Tensor,
+    depths: torch.Tensor,
+    tile_size: int,
+    tile_width: int,
+    tile_height: int,
+    *,
+    packed: bool = False,
+    n_images: Optional[int] = None,
+    image_ids: Optional[torch.Tensor] = None,
+    gaussian_ids: Optional[torch.Tensor] = None,
+    conics: Optional[torch.Tensor] = None,
+    opacities: Optional[torch.Tensor] = None,
+    segmented: bool = False,
+) -> torch.Tensor:
+    """Count per-Gaussian tile overlaps on MPS."""
+
+    inputs = _prepare_intersect_tile_inputs(
+        means2d,
+        radii,
+        depths,
+        tile_size,
+        tile_width,
+        tile_height,
+        packed=packed,
+        n_images=n_images,
+        image_ids=image_ids,
+        gaussian_ids=gaussian_ids,
+        conics=conics,
+        opacities=opacities,
+        segmented=segmented,
+    )
+    return _make_lazy_metal_func("metal_intersect_tile_count")(
+        means2d.contiguous(),
+        radii.contiguous(),
+        depths.contiguous(),
+        conics.contiguous() if conics is not None else None,
+        opacities.contiguous() if opacities is not None else None,
+        image_ids.contiguous() if image_ids is not None else None,
+        gaussian_ids.contiguous() if gaussian_ids is not None else None,
+        inputs.I,
+        tile_size,
+        tile_width,
+        tile_height,
+        packed,
+        segmented,
+    )
+
+
+def intersect_tile_emit(
+    means2d: torch.Tensor,
+    radii: torch.Tensor,
+    depths: torch.Tensor,
+    cum_tiles_per_gauss: torch.Tensor,
+    tile_size: int,
+    tile_width: int,
+    tile_height: int,
+    *,
+    packed: bool = False,
+    n_images: Optional[int] = None,
+    image_ids: Optional[torch.Tensor] = None,
+    gaussian_ids: Optional[torch.Tensor] = None,
+    conics: Optional[torch.Tensor] = None,
+    opacities: Optional[torch.Tensor] = None,
+    segmented: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Emit compact tile-intersection records on MPS using prefix-sum offsets."""
+
+    inputs = _prepare_intersect_tile_inputs(
+        means2d,
+        radii,
+        depths,
+        tile_size,
+        tile_width,
+        tile_height,
+        packed=packed,
+        n_images=n_images,
+        image_ids=image_ids,
+        gaussian_ids=gaussian_ids,
+        conics=conics,
+        opacities=opacities,
+        segmented=segmented,
+    )
+
+    if cum_tiles_per_gauss.device != means2d.device:
+        raise ValueError("cum_tiles_per_gauss must be on the same device as means2d")
+    if cum_tiles_per_gauss.dtype != torch.int64:
+        raise ValueError(f"cum_tiles_per_gauss must be int64, got {cum_tiles_per_gauss.dtype}")
+    if cum_tiles_per_gauss.shape != (inputs.n_elements,):
+        raise ValueError(
+            "cum_tiles_per_gauss must have shape "
+            f"({inputs.n_elements},), got {tuple(cum_tiles_per_gauss.shape)}"
+        )
+    return _make_lazy_metal_func("metal_intersect_tile_emit")(
+        means2d.contiguous(),
+        radii.contiguous(),
+        depths.contiguous(),
+        conics.contiguous() if conics is not None else None,
+        opacities.contiguous() if opacities is not None else None,
+        image_ids.contiguous() if image_ids is not None else None,
+        gaussian_ids.contiguous() if gaussian_ids is not None else None,
+        inputs.I,
+        tile_size,
+        tile_width,
+        tile_height,
+        cum_tiles_per_gauss.contiguous(),
+        packed,
+        segmented,
+    )
+
+
+def intersect_tiles(
+    means2d: torch.Tensor,
+    radii: torch.Tensor,
+    depths: torch.Tensor,
+    tile_size: int,
+    tile_width: int,
+    tile_height: int,
+    sort: bool = True,
+    segmented: bool = False,
+    packed: bool = False,
+    n_images: Optional[int] = None,
+    image_ids: Optional[torch.Tensor] = None,
+    gaussian_ids: Optional[torch.Tensor] = None,
+    conics: Optional[torch.Tensor] = None,
+    opacities: Optional[torch.Tensor] = None,
+):
+    """Map projected Gaussians to intersecting tiles on MPS.
+
+    This Metal backend implementation currently uses the axis-aligned tile box
+    path. It does not yet implement the CUDA AccuTile ellipse refinement when
+    ``conics`` and ``opacities`` are provided.
+    """
+    inputs = _prepare_intersect_tile_inputs(
+        means2d,
+        radii,
+        depths,
+        tile_size,
+        tile_width,
+        tile_height,
+        packed=packed,
+        n_images=n_images,
+        image_ids=image_ids,
+        gaussian_ids=gaussian_ids,
+        conics=conics,
+        opacities=opacities,
+        segmented=segmented,
+    )
+    return _make_lazy_metal_func("metal_intersect_tile")(
+        means2d.contiguous(),
+        radii.contiguous(),
+        depths.contiguous(),
+        conics.contiguous() if conics is not None else None,
+        opacities.contiguous() if opacities is not None else None,
+        image_ids.contiguous() if image_ids is not None else None,
+        gaussian_ids.contiguous() if gaussian_ids is not None else None,
+        inputs.I,
+        tile_size,
+        tile_width,
+        tile_height,
+        sort,
+        packed,
+        segmented,
     )
 
 

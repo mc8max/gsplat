@@ -6,6 +6,7 @@
 from gsplat.cuda._math import _quat_scale_to_covar_preci
 from gsplat.cuda._torch_impl import (
     _fisheye_proj,
+    _isect_tiles,
     _isect_offset_encode,
     _ortho_proj,
     _persp_proj,
@@ -14,6 +15,7 @@ from gsplat.cuda._torch_impl import (
 
 __all__ = [
     "_fisheye_proj",
+    "_isect_tiles",
     "_isect_offset_encode",
     "_ortho_proj",
     "_persp_proj",
