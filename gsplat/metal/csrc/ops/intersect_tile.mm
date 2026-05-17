@@ -24,6 +24,7 @@ namespace {
 
 struct IntersectTileConfig {
     bool packed;
+    bool use_accutile;
     uint32_t I;
     uint32_t N;
     uint32_t n_elements;
@@ -69,10 +70,6 @@ IntersectTileConfig validate_common(
     TORCH_CHECK(tile_width > 0, "tile_width must be positive");
     TORCH_CHECK(tile_height > 0, "tile_height must be positive");
     TORCH_CHECK(!segmented, "Metal intersect_tiles does not support segmented=True yet");
-    TORCH_CHECK(
-        !conics.has_value() && !opacities.has_value(),
-        "Metal intersect_tiles currently supports only the AABB path. "
-        "Rejecting AccuTile inputs until conics/opacities parity is implemented.");
 
     // packed is passed explicitly by the caller; do not infer from tensor rank.
     TORCH_CHECK(means2d.size(-1) == 2, "means2d last dimension must be 2");
@@ -80,6 +77,7 @@ IntersectTileConfig validate_common(
 
     IntersectTileConfig cfg{};
     cfg.packed = packed;
+    cfg.use_accutile = conics.has_value() && opacities.has_value();
     cfg.tile_size = static_cast<uint32_t>(tile_size);
     cfg.tile_width = static_cast<uint32_t>(tile_width);
     cfg.tile_height = static_cast<uint32_t>(tile_height);
@@ -105,6 +103,16 @@ IntersectTileConfig validate_common(
         cfg.I = static_cast<uint32_t>(I);
         cfg.N = 0;
         cfg.n_elements = product_i64_to_u32({nnz}, "means2d");
+        if (conics.has_value()) {
+            check_mps_float32(*conics, "conics");
+            TORCH_CHECK(conics->dim() == 2 && conics->size(0) == nnz && conics->size(1) == 3,
+                "packed conics must have shape (nnz, 3)");
+        }
+        if (opacities.has_value()) {
+            check_mps_float32(*opacities, "opacities");
+            TORCH_CHECK(opacities->dim() == 1 && opacities->size(0) == nnz,
+                "packed opacities must have shape (nnz,)");
+        }
     } else {
         TORCH_CHECK(depths.dim() == means2d.dim() - 1, "depths must have shape means2d.shape[:-1]");
         TORCH_CHECK(
@@ -121,6 +129,16 @@ IntersectTileConfig validate_common(
             "I must match the product of means2d image dimensions");
         cfg.I = inferred_I;
         cfg.n_elements = product_i64_to_u32(depths.sizes(), "depths");
+        if (conics.has_value()) {
+            check_mps_float32(*conics, "conics");
+            auto expected = means2d.sizes().slice(0, means2d.dim() - 1).vec();
+            expected.back() = 3;
+            TORCH_CHECK(conics->sizes().vec() == expected, "unpacked conics must have shape [..., N, 3]");
+        }
+        if (opacities.has_value()) {
+            check_mps_float32(*opacities, "opacities");
+            TORCH_CHECK(opacities->sizes().equals(depths.sizes()), "unpacked opacities must match depths shape");
+        }
     }
 
     return cfg;
@@ -165,7 +183,9 @@ at::Tensor intersect_tile_count_op(
     }
 
     auto& ctx = MetalContext::instance();
-    id<MTLComputePipelineState> pso = ctx.pipeline("intersect_tile_count_kernel");
+    id<MTLComputePipelineState> pso = ctx.pipeline(
+        cfg.use_accutile ? "intersect_tile_count_accutile_kernel"
+                         : "intersect_tile_count_aabb_kernel");
     auto* mps_stream = at::mps::getCurrentMPSStream();
     TORCH_CHECK(mps_stream != nullptr, "Failed to acquire current MPS stream");
 
@@ -177,11 +197,13 @@ at::Tensor intersect_tile_count_op(
             [enc setComputePipelineState:pso];
             [enc setBuffer:to_mtl_buffer(means2d) offset:byte_offset(means2d) atIndex:0];
             [enc setBuffer:to_mtl_buffer(radii) offset:byte_offset(radii) atIndex:1];
-            [enc setBuffer:to_mtl_buffer(tiles_per_gauss) offset:byte_offset(tiles_per_gauss) atIndex:2];
-            [enc setBytes:&cfg.n_elements length:sizeof(cfg.n_elements) atIndex:3];
-            [enc setBytes:&cfg.tile_size length:sizeof(cfg.tile_size) atIndex:4];
-            [enc setBytes:&cfg.tile_width length:sizeof(cfg.tile_width) atIndex:5];
-            [enc setBytes:&cfg.tile_height length:sizeof(cfg.tile_height) atIndex:6];
+            set_optional_tensor_buffer(enc, conics.has_value() ? *conics : at::Tensor{}, 2);
+            set_optional_tensor_buffer(enc, opacities.has_value() ? *opacities : at::Tensor{}, 3);
+            [enc setBuffer:to_mtl_buffer(tiles_per_gauss) offset:byte_offset(tiles_per_gauss) atIndex:4];
+            [enc setBytes:&cfg.n_elements length:sizeof(cfg.n_elements) atIndex:5];
+            [enc setBytes:&cfg.tile_size length:sizeof(cfg.tile_size) atIndex:6];
+            [enc setBytes:&cfg.tile_width length:sizeof(cfg.tile_width) atIndex:7];
+            [enc setBytes:&cfg.tile_height length:sizeof(cfg.tile_height) atIndex:8];
 
             const uint32_t tg = static_cast<uint32_t>(pso.maxTotalThreadsPerThreadgroup);
             const uint32_t threads = std::min(tg, cfg.n_elements);
@@ -235,9 +257,13 @@ std::tuple<at::Tensor, at::Tensor> intersect_tile_emit_op(
         return std::make_tuple(isect_ids, flatten_ids);
     }
 
+    const at::Tensor conics_arg = conics.has_value() ? *conics : at::Tensor{};
+    const at::Tensor opacities_arg = opacities.has_value() ? *opacities : at::Tensor{};
     const at::Tensor image_ids_arg = cfg.packed ? *image_ids : at::Tensor{};
     auto& ctx = MetalContext::instance();
-    id<MTLComputePipelineState> pso = ctx.pipeline("intersect_tile_emit_kernel");
+    id<MTLComputePipelineState> pso = ctx.pipeline(
+        cfg.use_accutile ? "intersect_tile_emit_accutile_kernel"
+                         : "intersect_tile_emit_aabb_kernel");
     auto* mps_stream = at::mps::getCurrentMPSStream();
     TORCH_CHECK(mps_stream != nullptr, "Failed to acquire current MPS stream");
     const uint32_t packed_u32 = cfg.packed ? 1u : 0u;
@@ -251,17 +277,19 @@ std::tuple<at::Tensor, at::Tensor> intersect_tile_emit_op(
             [enc setBuffer:to_mtl_buffer(means2d) offset:byte_offset(means2d) atIndex:0];
             [enc setBuffer:to_mtl_buffer(radii) offset:byte_offset(radii) atIndex:1];
             [enc setBuffer:to_mtl_buffer(depths) offset:byte_offset(depths) atIndex:2];
-            set_optional_tensor_buffer(enc, image_ids_arg, 3);
-            [enc setBuffer:to_mtl_buffer(cum_tiles_per_gauss) offset:byte_offset(cum_tiles_per_gauss) atIndex:4];
-            [enc setBuffer:to_mtl_buffer(isect_ids) offset:byte_offset(isect_ids) atIndex:5];
-            [enc setBuffer:to_mtl_buffer(flatten_ids) offset:byte_offset(flatten_ids) atIndex:6];
-            [enc setBytes:&cfg.n_elements length:sizeof(cfg.n_elements) atIndex:7];
-            [enc setBytes:&cfg.N length:sizeof(cfg.N) atIndex:8];
-            [enc setBytes:&cfg.tile_size length:sizeof(cfg.tile_size) atIndex:9];
-            [enc setBytes:&cfg.tile_width length:sizeof(cfg.tile_width) atIndex:10];
-            [enc setBytes:&cfg.tile_height length:sizeof(cfg.tile_height) atIndex:11];
-            [enc setBytes:&cfg.tile_n_bits length:sizeof(cfg.tile_n_bits) atIndex:12];
-            [enc setBytes:&packed_u32 length:sizeof(packed_u32) atIndex:13];
+            set_optional_tensor_buffer(enc, conics_arg, 3);
+            set_optional_tensor_buffer(enc, opacities_arg, 4);
+            set_optional_tensor_buffer(enc, image_ids_arg, 5);
+            [enc setBuffer:to_mtl_buffer(cum_tiles_per_gauss) offset:byte_offset(cum_tiles_per_gauss) atIndex:6];
+            [enc setBuffer:to_mtl_buffer(isect_ids) offset:byte_offset(isect_ids) atIndex:7];
+            [enc setBuffer:to_mtl_buffer(flatten_ids) offset:byte_offset(flatten_ids) atIndex:8];
+            [enc setBytes:&cfg.n_elements length:sizeof(cfg.n_elements) atIndex:9];
+            [enc setBytes:&cfg.N length:sizeof(cfg.N) atIndex:10];
+            [enc setBytes:&cfg.tile_size length:sizeof(cfg.tile_size) atIndex:11];
+            [enc setBytes:&cfg.tile_width length:sizeof(cfg.tile_width) atIndex:12];
+            [enc setBytes:&cfg.tile_height length:sizeof(cfg.tile_height) atIndex:13];
+            [enc setBytes:&cfg.tile_n_bits length:sizeof(cfg.tile_n_bits) atIndex:14];
+            [enc setBytes:&packed_u32 length:sizeof(packed_u32) atIndex:15];
 
             const uint32_t tg = static_cast<uint32_t>(pso.maxTotalThreadsPerThreadgroup);
             const uint32_t threads = std::min(tg, cfg.n_elements);

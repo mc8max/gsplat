@@ -138,11 +138,6 @@ def _prepare_intersect_tile_inputs(
         )
     if segmented:
         raise NotImplementedError("Metal intersect_tiles does not support segmented=True yet")
-    if conics is not None or opacities is not None:
-        raise NotImplementedError(
-            "Metal intersect_tiles currently supports only the AABB path. "
-            "Rejecting AccuTile inputs until conics/opacities parity is implemented."
-        )
 
     if packed:
         nnz = means2d.size(0)
@@ -170,6 +165,20 @@ def _prepare_intersect_tile_inputs(
             raise ValueError(f"gaussian_ids must be int64, got {gaussian_ids.dtype}")
         if n_images < 0:
             raise ValueError(f"n_images must be non-negative, got {n_images}")
+        if conics is not None:
+            if conics.shape != (nnz, 3):
+                raise ValueError(f"packed conics must have shape (nnz, 3), got {conics.shape}")
+            if conics.device != means2d.device or conics.dtype != torch.float32:
+                raise ValueError("packed conics must be float32 on the same device as means2d")
+        if opacities is not None:
+            if opacities.shape != (nnz,):
+                raise ValueError(
+                    f"packed opacities must have shape (nnz,), got {opacities.shape}"
+                )
+            if opacities.device != means2d.device or opacities.dtype != torch.float32:
+                raise ValueError(
+                    "packed opacities must be float32 on the same device as means2d"
+                )
         I = n_images
         N = None
         n_elements = nnz
@@ -182,6 +191,20 @@ def _prepare_intersect_tile_inputs(
             raise ValueError(f"depths must have shape {image_dims + (N,)}, got {depths.shape}")
         if image_ids is not None or gaussian_ids is not None:
             raise ValueError("image_ids and gaussian_ids must be omitted when packed=False")
+        if conics is not None:
+            if conics.shape != image_dims + (N, 3):
+                raise ValueError(
+                    f"conics must have shape {image_dims + (N, 3)}, got {conics.shape}"
+                )
+            if conics.device != means2d.device or conics.dtype != torch.float32:
+                raise ValueError("conics must be float32 on the same device as means2d")
+        if opacities is not None:
+            if opacities.shape != image_dims + (N,):
+                raise ValueError(
+                    f"opacities must have shape {image_dims + (N,)}, got {opacities.shape}"
+                )
+            if opacities.device != means2d.device or opacities.dtype != torch.float32:
+                raise ValueError("opacities must be float32 on the same device as means2d")
         I = math.prod(image_dims)
         n_elements = I * N
 
@@ -333,9 +356,9 @@ def intersect_tiles(
 ):
     """Map projected Gaussians to intersecting tiles on MPS.
 
-    This Metal backend implementation currently uses the axis-aligned tile box
-    path. It does not yet implement the CUDA AccuTile ellipse refinement when
-    ``conics`` and ``opacities`` are provided.
+    This Metal backend implementation uses the CUDA-style AABB path by default
+    and switches to the AccuTile ellipse refinement when both ``conics`` and
+    ``opacities`` are provided.
     """
     inputs = _prepare_intersect_tile_inputs(
         means2d,
