@@ -131,8 +131,8 @@ IntersectTileConfig validate_common(
         cfg.n_elements = product_i64_to_u32(depths.sizes(), "depths");
         if (conics.has_value()) {
             check_mps_float32(*conics, "conics");
-            auto expected = means2d.sizes().slice(0, means2d.dim() - 1).vec();
-            expected.back() = 3;
+            auto expected = means2d.sizes().vec();  // [..., N, 2]
+            expected.back() = 3;                    // [..., N, 3]
             TORCH_CHECK(conics->sizes().vec() == expected, "unpacked conics must have shape [..., N, 3]");
         }
         if (opacities.has_value()) {
@@ -297,7 +297,11 @@ std::tuple<at::Tensor, at::Tensor> intersect_tile_emit_op(
               threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
         }
     });
-    mps_stream->synchronize(at::mps::SyncType::COMMIT);
+    // COMMIT_AND_WAIT ensures the emit kernel has finished writing isect_ids
+    // before the tensor is returned to the caller. COMMIT alone is insufficient
+    // here because the sort=False path returns the tensor directly to Python
+    // without any subsequent MPS op that would force completion.
+    mps_stream->synchronize(at::mps::SyncType::COMMIT_AND_WAIT);
     return std::make_tuple(isect_ids, flatten_ids);
 }
 
