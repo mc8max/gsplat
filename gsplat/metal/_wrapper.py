@@ -136,9 +136,6 @@ def _prepare_intersect_tile_inputs(
             f"tile_size/tile_width/tile_height must be positive, got "
             f"{tile_size}/{tile_width}/{tile_height}"
         )
-    if segmented:
-        raise NotImplementedError("Metal intersect_tiles does not support segmented=True yet")
-
     if packed:
         nnz = means2d.size(0)
         if means2d.shape != (nnz, 2):

@@ -506,13 +506,107 @@ def test_packed_chain_matches_manual_reference(mps_device):
     _assert_equal(actual_offsets, expected_offsets)
 
 
-def test_segmented_rejected(mps_device):
-    means2d = torch.tensor([[[3.0, 3.0]]], dtype=torch.float32, device=mps_device)
-    radii = torch.tensor([[[1, 1]]], dtype=torch.int32, device=mps_device)
-    depths = torch.tensor([[0.1]], dtype=torch.float32, device=mps_device)
+def test_segmented_matches_default_sort_unpacked(mps_device):
+    tile_size = 4
+    tile_width = 6
+    tile_height = 5
+    means2d = torch.tensor(
+        [
+            [[3.0, 3.0], [8.0, 6.0], [15.0, 9.0]],
+            [[2.0, 14.0], [18.0, 10.0], [7.0, 4.0]],
+        ],
+        dtype=torch.float32,
+    )
+    radii = torch.tensor(
+        [
+            [[1, 1], [3, 2], [0, 0]],
+            [[2, 1], [4, 3], [1, 2]],
+        ],
+        dtype=torch.int32,
+    )
+    depths = torch.tensor(
+        [[0.1, 0.4, 0.7], [0.3, 0.2, 0.5]],
+        dtype=torch.float32,
+    )
 
-    with pytest.raises(NotImplementedError, match="segmented=True"):
-        gm.intersect_tiles(means2d, radii, depths, 4, 4, 4, segmented=True)
+    expected = gm.intersect_tiles(
+        means2d.to(mps_device),
+        radii.to(mps_device),
+        depths.to(mps_device),
+        tile_size,
+        tile_width,
+        tile_height,
+        sort=True,
+        segmented=False,
+    )
+    actual = gm.intersect_tiles(
+        means2d.to(mps_device),
+        radii.to(mps_device),
+        depths.to(mps_device),
+        tile_size,
+        tile_width,
+        tile_height,
+        sort=True,
+        segmented=True,
+    )
+    _assert_equal(actual, expected)
+
+
+def test_segmented_matches_default_sort_packed(mps_device):
+    tile_size = 4
+    tile_width = 5
+    tile_height = 4
+    means2d = torch.tensor(
+        [[3.0, 3.0], [7.0, 6.0], [11.0, 5.0], [15.0, 8.0]],
+        dtype=torch.float32,
+    )
+    radii = torch.tensor(
+        [[1, 1], [2, 1], [0, 0], [2, 2]],
+        dtype=torch.int32,
+    )
+    depths = torch.tensor([0.1, 0.2, 0.3, 0.4], dtype=torch.float32)
+    image_ids = torch.tensor([0, 0, 1, 1], dtype=torch.int64)
+    gaussian_ids = torch.arange(means2d.size(0), dtype=torch.int64)
+
+    expected = gm.intersect_tiles(
+        means2d.to(mps_device),
+        radii.to(mps_device),
+        depths.to(mps_device),
+        tile_size,
+        tile_width,
+        tile_height,
+        sort=True,
+        segmented=False,
+        packed=True,
+        n_images=2,
+        image_ids=image_ids.to(mps_device),
+        gaussian_ids=gaussian_ids.to(mps_device),
+    )
+    actual = gm.intersect_tiles(
+        means2d.to(mps_device),
+        radii.to(mps_device),
+        depths.to(mps_device),
+        tile_size,
+        tile_width,
+        tile_height,
+        sort=True,
+        segmented=True,
+        packed=True,
+        n_images=2,
+        image_ids=image_ids.to(mps_device),
+        gaussian_ids=gaussian_ids.to(mps_device),
+    )
+    _assert_equal(actual, expected)
+
+
+def test_segmented_sort_false_matches_unsorted_emit(mps_device):
+    means2d = torch.tensor([[[7.0, 7.0], [3.0, 3.0]]], dtype=torch.float32, device=mps_device)
+    radii = torch.tensor([[[2, 2], [1, 1]]], dtype=torch.int32, device=mps_device)
+    depths = torch.tensor([[0.2, 0.1]], dtype=torch.float32, device=mps_device)
+
+    expected = gm.intersect_tiles(means2d, radii, depths, 4, 4, 4, sort=False, segmented=False)
+    actual = gm.intersect_tiles(means2d, radii, depths, 4, 4, 4, sort=False, segmented=True)
+    _assert_equal(actual, expected)
 
 
 def test_accutile_unpacked_matches_reference(mps_device):
