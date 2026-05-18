@@ -11,12 +11,19 @@
 #include "ops/projection_ewa_simple.h"
 #include "ops/quat_scale_to_covar_preci.h"
 #include "ops/spherical_harmonics.h"
+#include "ops/sort_int64.h"
 
 using namespace gsplat::metal;
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("load_library", [](const std::string& path) {
         MetalContext::instance().load_library(path);
+    });
+    m.def("mps_lsd_sort", [](const at::Tensor& ids, const at::Tensor& vals) {
+        return mps_lsd_sort(ids, vals, true);
+    });
+    m.def("radix_sort", [](const at::Tensor& ids, const at::Tensor& vals) {
+        return radix_sort(ids, vals, true);
     });
 }
 

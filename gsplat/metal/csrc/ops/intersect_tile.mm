@@ -6,8 +6,9 @@
 #include <algorithm>
 #include <array>
 #include <limits>
-#include <numeric>
 #include <torch/extension.h>
+
+#include "sort_int64.h"
 
 #if TORCH_VERSION_MAJOR < 2
 #  error "gsplat Metal backend requires PyTorch >= 2.0 (MPS support unavailable)"
@@ -150,69 +151,6 @@ IntersectTileConfig validate_common(
 
 
 }  // namespace
-
-std::tuple<at::Tensor, at::Tensor> segmented_sort_cpu_fallback(
-    const at::Tensor& isect_ids,
-    const at::Tensor& flatten_ids,
-    int64_t I,
-    uint32_t tile_n_bits,
-    const at::Device& device
-) {
-    TORCH_CHECK(I >= 0, "I must be non-negative for segmented sort");
-    TORCH_CHECK(
-        static_cast<uint64_t>(I) <=
-            static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()),
-        "I must fit in uint32_t for segmented sort bucket allocation");
-
-    at::Tensor isect_ids_cpu = isect_ids.cpu();
-    at::Tensor flatten_ids_cpu = flatten_ids.cpu();
-    auto sorted_isect_ids_cpu = at::empty_like(isect_ids_cpu);
-    auto sorted_flatten_ids_cpu = at::empty_like(flatten_ids_cpu);
-
-    const int64_t n_isects = isect_ids_cpu.numel();
-    if (n_isects == 0) {
-        return std::make_tuple(
-            sorted_isect_ids_cpu.to(device),
-            sorted_flatten_ids_cpu.to(device));
-    }
-
-    auto* in_keys = isect_ids_cpu.data_ptr<int64_t>();
-    auto* in_vals = flatten_ids_cpu.data_ptr<int32_t>();
-    auto* out_keys = sorted_isect_ids_cpu.data_ptr<int64_t>();
-    auto* out_vals = sorted_flatten_ids_cpu.data_ptr<int32_t>();
-
-    std::vector<std::vector<int64_t>> buckets_keys(static_cast<size_t>(I));
-    std::vector<std::vector<int32_t>> buckets_vals(static_cast<size_t>(I));
-    const uint64_t image_shift = 32u + tile_n_bits;
-
-    for (int64_t idx = 0; idx < n_isects; ++idx) {
-        const uint64_t key_u64 = static_cast<uint64_t>(in_keys[idx]);
-        const uint64_t image_id = key_u64 >> image_shift;
-        TORCH_CHECK(image_id < static_cast<uint64_t>(I), "segmented sort image id out of range");
-        buckets_keys[static_cast<size_t>(image_id)].push_back(in_keys[idx]);
-        buckets_vals[static_cast<size_t>(image_id)].push_back(in_vals[idx]);
-    }
-
-    int64_t write_idx = 0;
-    for (int64_t image_id = 0; image_id < I; ++image_id) {
-        auto& keys = buckets_keys[static_cast<size_t>(image_id)];
-        auto& vals = buckets_vals[static_cast<size_t>(image_id)];
-        std::vector<int64_t> order(keys.size());
-        std::iota(order.begin(), order.end(), 0);
-        std::stable_sort(order.begin(), order.end(), [&](const int64_t a, const int64_t b) {
-            return keys[static_cast<size_t>(a)] < keys[static_cast<size_t>(b)];
-        });
-        for (const int64_t ord : order) {
-            out_keys[write_idx] = keys[static_cast<size_t>(ord)];
-            out_vals[write_idx] = vals[static_cast<size_t>(ord)];
-            ++write_idx;
-        }
-    }
-
-    return std::make_tuple(
-        sorted_isect_ids_cpu.to(device),
-        sorted_flatten_ids_cpu.to(device));
-}
 
 at::Tensor intersect_tile_count_op(
     const at::Tensor& means2d,
@@ -437,29 +375,13 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> intersect_tile_op(
     at::Tensor flatten_ids = std::get<1>(emit_out);
 
     if (sort) {
-        // TODO: replace with on-device sort. For now keep sorting inside the
-        // native backend boundary. `segmented=True` sorts per image and then
-        // concatenates image buckets in image-id order, which matches the final
-        // key order because image_id occupies the high bits of `isect_ids`.
-        if (segmented) {
-            const uint32_t tile_n_bits = tile_n_bits_from_grid(tile_width, tile_height);
-            auto segmented_out = segmented_sort_cpu_fallback(
-                isect_ids,
-                flatten_ids,
-                I,
-                tile_n_bits,
-                means2d.device());
-            isect_ids = std::get<0>(segmented_out);
-            flatten_ids = std::get<1>(segmented_out);
-        } else {
-            at::Tensor isect_ids_cpu = isect_ids.cpu();
-            auto sort_out = at::sort(isect_ids_cpu, 0, false);
-            at::Tensor sorted_isect_ids_cpu = std::get<0>(sort_out);
-            at::Tensor order_cpu = std::get<1>(sort_out);
-            at::Tensor sorted_flatten_ids_cpu = flatten_ids.cpu().index_select(0, order_cpu);
-            isect_ids = sorted_isect_ids_cpu.to(means2d.device());
-            flatten_ids = sorted_flatten_ids_cpu.to(means2d.device());
-        }
+        // 4-pass 16-bit LSD stable sort entirely on MPS — no PCIe transfer.
+        // Global sort by the full 64-bit key gives correct per-image ordering
+        // because image_id occupies the most significant bits, so the global
+        // result is identical to a segmented (per-image) sort.
+        auto sorted = radix_sort(isect_ids, flatten_ids, /*stable=*/true);
+        isect_ids   = sorted.first;
+        flatten_ids = sorted.second;
     }
 
     return std::make_tuple(tiles_per_gauss, isect_ids, flatten_ids.to(at::kInt));

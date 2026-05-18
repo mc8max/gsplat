@@ -32,10 +32,10 @@ def compile_metallib(mode: str = "release") -> str:
     ensure_xcrun_available()
     os.makedirs(MODULE_CACHE_PATH, exist_ok=True)
     metal_files = sorted(
-        glob.glob(os.path.join(PATH, "csrc", "ops", "**", "*.metal"), recursive=True)
+        glob.glob(os.path.join(PATH, "csrc", "**", "*.metal"), recursive=True)
     )
     if not metal_files:
-        raise FileNotFoundError("No .metal files found under gsplat/metal/csrc/ops")
+        raise FileNotFoundError("No .metal files found under gsplat/metal/csrc")
 
     output = os.path.join(PATH, "gsplat_metal.metallib")
     with tempfile.TemporaryDirectory() as tmpdir:
