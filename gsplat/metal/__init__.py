@@ -7,6 +7,7 @@ from ._backend import has_metal
 from ._wrapper import (
     distort_camera_rays,
     eval_bivariate_poly,
+    fully_fused_projection,
     intersect_offset_encode,
     intersect_tile_count,
     intersect_tile_emit,
@@ -20,6 +21,7 @@ from ._wrapper import (
 __all__ = [
     "distort_camera_rays",
     "eval_bivariate_poly",
+    "fully_fused_projection",
     "has_metal",
     "intersect_offset_encode",
     "intersect_tile_count",

@@ -12,8 +12,6 @@ from typing import Optional
 import torch
 
 from ._backend import load
-
-
 @dataclass(frozen=True)
 class _IntersectTileInputs:
     I: int
@@ -520,6 +518,141 @@ class _ProjectionEWASimple(torch.autograd.Function):
         return v_means, v_covars, None, None, None, None
 
 
+class _FullyFusedProjection(torch.autograd.Function):
+    """Autograd bridge for the Metal fused 3DGS projection op."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        means,
+        covars,
+        quats,
+        scales,
+        viewmats,
+        Ks,
+        width,
+        height,
+        eps2d,
+        near_plane,
+        far_plane,
+        radius_clip,
+        calc_compensations,
+        camera_model="pinhole",
+        opacities=None,
+    ):
+        if camera_model == "ftheta":
+            raise ValueError(
+                "ftheta camera is only supported via UT, please set with_ut=True in the rasterization()"
+            )
+        if camera_model not in _CAMERA_MODEL_TO_INT:
+            raise ValueError(
+                f"camera_model must be one of {tuple(_CAMERA_MODEL_TO_INT)}, got {camera_model}"
+            )
+
+        camera_model_type = _CAMERA_MODEL_TO_INT[camera_model]
+        radii, means2d, depths, conics, compensations = _make_lazy_metal_func(
+            "metal_projection_ewa_3dgs_fused_fwd"
+        )(
+            means,
+            covars,
+            quats,
+            scales,
+            opacities,
+            viewmats,
+            Ks,
+            width,
+            height,
+            eps2d,
+            near_plane,
+            far_plane,
+            radius_clip,
+            calc_compensations,
+            camera_model_type,
+        )
+        ctx.save_for_backward(
+            means,
+            covars if covars is not None else torch.empty(0, device=means.device, dtype=means.dtype),
+            quats if quats is not None else torch.empty(0, device=means.device, dtype=means.dtype),
+            scales if scales is not None else torch.empty(0, device=means.device, dtype=means.dtype),
+            viewmats,
+            Ks,
+            radii,
+            conics,
+            compensations
+            if compensations is not None
+            else torch.empty(0, device=means.device, dtype=means.dtype),
+        )
+        ctx.width = width
+        ctx.height = height
+        ctx.eps2d = eps2d
+        ctx.camera_model_type = camera_model_type
+        ctx.has_covars = covars is not None
+        ctx.has_quats = quats is not None
+        ctx.has_scales = scales is not None
+        ctx.has_compensations = compensations is not None
+        return radii, means2d, depths, conics, compensations
+
+    @staticmethod
+    def backward(ctx, v_radii, v_means2d, v_depths, v_conics, v_compensations):
+        means, covars, quats, scales, viewmats, Ks, radii, conics, compensations = ctx.saved_tensors
+        covars = covars if ctx.has_covars else None
+        quats = quats if ctx.has_quats else None
+        scales = scales if ctx.has_scales else None
+        compensations = compensations if ctx.has_compensations else None
+        if v_compensations is not None:
+            v_compensations = v_compensations.contiguous()
+
+        v_means, v_covars, v_quats, v_scales, v_viewmats = _make_lazy_metal_func(
+            "metal_projection_ewa_3dgs_fused_bwd"
+        )(
+            means,
+            covars,
+            quats,
+            scales,
+            viewmats,
+            Ks,
+            ctx.width,
+            ctx.height,
+            ctx.eps2d,
+            ctx.camera_model_type,
+            radii,
+            conics,
+            compensations,
+            v_means2d.contiguous(),
+            v_depths.contiguous(),
+            v_conics.contiguous(),
+            v_compensations,
+            ctx.needs_input_grad[4],
+        )
+        if not ctx.needs_input_grad[0]:
+            v_means = None
+        if not ctx.needs_input_grad[1]:
+            v_covars = None
+        if not ctx.needs_input_grad[2]:
+            v_quats = None
+        if not ctx.needs_input_grad[3]:
+            v_scales = None
+        if not ctx.needs_input_grad[4]:
+            v_viewmats = None
+        return (
+            v_means,
+            v_covars,
+            v_quats,
+            v_scales,
+            v_viewmats,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+
+
 def quat_scale_to_covar_preci(
     quats: torch.Tensor,
     scales: torch.Tensor,
@@ -630,4 +763,100 @@ def projection_ewa_simple(
         width,
         height,
         camera_model,
+    )
+
+
+def fully_fused_projection(
+    means: torch.Tensor,
+    covars: Optional[torch.Tensor],
+    quats: Optional[torch.Tensor],
+    scales: Optional[torch.Tensor],
+    viewmats: torch.Tensor,
+    Ks: torch.Tensor,
+    width: int,
+    height: int,
+    eps2d: float = 0.3,
+    near_plane: float = 0.01,
+    far_plane: float = 1e10,
+    radius_clip: float = 0.0,
+    packed: bool = False,
+    sparse_grad: bool = False,
+    calc_compensations: bool = False,
+    camera_model: str = "pinhole",
+    opacities: Optional[torch.Tensor] = None,
+):
+    """Project world-space 3DGS Gaussians to screen-space on MPS."""
+
+    if packed:
+        raise NotImplementedError("Metal fully_fused_projection currently supports packed=False only")
+    if sparse_grad:
+        raise NotImplementedError("Metal fully_fused_projection does not support sparse_grad")
+    if camera_model == "ftheta":
+        raise ValueError(
+            "ftheta camera is only supported via UT, please set with_ut=True in the rasterization()"
+        )
+    if camera_model not in _CAMERA_MODEL_TO_INT:
+        raise ValueError(
+            f"camera_model must be one of {tuple(_CAMERA_MODEL_TO_INT)}, got {camera_model}"
+        )
+    if means.device.type != "mps":
+        raise ValueError(f"means must be on MPS, got {means.device}")
+    if means.dtype != torch.float32:
+        raise ValueError(f"means must be float32, got {means.dtype}")
+    if viewmats.device != means.device or Ks.device != means.device:
+        raise ValueError("viewmats and Ks must be on the same device as means")
+    if viewmats.dtype != torch.float32 or Ks.dtype != torch.float32:
+        raise ValueError("viewmats and Ks must be float32")
+
+    batch_dims = means.shape[:-2]
+    N = means.shape[-2]
+    C = viewmats.shape[-3]
+    if means.shape != batch_dims + (N, 3):
+        raise ValueError(f"means must have shape [..., N, 3], got {means.shape}")
+    if viewmats.shape != batch_dims + (C, 4, 4):
+        raise ValueError(f"viewmats must have shape {batch_dims + (C, 4, 4)}, got {viewmats.shape}")
+    if Ks.shape != batch_dims + (C, 3, 3):
+        raise ValueError(f"Ks must have shape {batch_dims + (C, 3, 3)}, got {Ks.shape}")
+
+    if covars is not None:
+        if quats is not None or scales is not None:
+            raise ValueError("covars and {quats, scales} are mutually exclusive")
+        if covars.device != means.device or covars.dtype != torch.float32:
+            raise ValueError("covars must be float32 on the same device as means")
+        if covars.shape != batch_dims + (N, 6):
+            raise ValueError(f"covars must have shape {batch_dims + (N, 6)}, got {covars.shape}")
+    else:
+        if quats is None or scales is None:
+            raise ValueError("either covars or {quats, scales} must be provided")
+        if quats.device != means.device or scales.device != means.device:
+            raise ValueError("quats and scales must be on the same device as means")
+        if quats.dtype != torch.float32 or scales.dtype != torch.float32:
+            raise ValueError("quats and scales must be float32")
+        if quats.shape != batch_dims + (N, 4):
+            raise ValueError(f"quats must have shape {batch_dims + (N, 4)}, got {quats.shape}")
+        if scales.shape != batch_dims + (N, 3):
+            raise ValueError(f"scales must have shape {batch_dims + (N, 3)}, got {scales.shape}")
+
+    if opacities is not None:
+        if opacities.device != means.device or opacities.dtype != torch.float32:
+            raise ValueError("opacities must be float32 on the same device as means")
+        if opacities.shape != batch_dims + (N,):
+            raise ValueError(f"opacities must have shape {batch_dims + (N,)}, got {opacities.shape}")
+        opacities = opacities.contiguous()
+    return _FullyFusedProjection.apply(
+        means.contiguous(),
+        covars.contiguous() if covars is not None else None,
+        quats.contiguous() if quats is not None else None,
+        scales.contiguous() if scales is not None else None,
+        viewmats.contiguous(),
+        Ks.contiguous(),
+        width,
+        height,
+        eps2d,
+        near_plane,
+        far_plane,
+        radius_clip,
+        calc_compensations,
+        camera_model,
+        opacities,
     )

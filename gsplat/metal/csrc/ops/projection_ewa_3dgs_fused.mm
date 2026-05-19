@@ -1,0 +1,641 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+#import <Metal/Metal.h>
+
+#include <algorithm>
+#include <tuple>
+#include <vector>
+
+#include <torch/extension.h>
+
+#if TORCH_VERSION_MAJOR < 2
+#  error "gsplat Metal backend requires PyTorch >= 2.0 (MPS support unavailable)"
+#endif
+#include <ATen/mps/MPSStream.h>
+
+#include "MetalContext.h"
+#include "MPSTensor.h"
+#include "projection_ewa_3dgs_fused.h"
+#include "quat_scale_to_covar_preci.h"
+
+namespace gsplat::metal {
+
+using namespace torch::indexing;
+
+namespace {
+
+constexpr int64_t kCameraModelPinhole = 0;
+constexpr int64_t kCameraModelOrtho = 1;
+constexpr int64_t kCameraModelFisheye = 2;
+constexpr double kAlphaThreshold = 1.0 / 255.0;
+constexpr double kGaussianExtend = 3.33;
+constexpr double kMinCompensation = 0.25;
+
+void check_camera_model(int64_t camera_model) {
+    TORCH_CHECK(
+        camera_model == kCameraModelPinhole || camera_model == kCameraModelOrtho ||
+            camera_model == kCameraModelFisheye,
+        "camera_model must be one of pinhole(0), ortho(1), fisheye(2)");
+}
+
+void validate_forward_common(
+    const at::Tensor& means,
+    const at::Tensor& viewmats,
+    const at::Tensor& Ks,
+    int64_t image_width,
+    int64_t image_height,
+    int64_t camera_model
+) {
+    check_mps_float32(means, "means");
+    check_mps_float32(viewmats, "viewmats");
+    check_mps_float32(Ks, "Ks");
+
+    TORCH_CHECK(means.dim() >= 2, "means must have shape [..., N, 3]");
+    TORCH_CHECK(means.size(-1) == 3, "means last dimension must be 3");
+    TORCH_CHECK(viewmats.dim() == means.dim() + 1, "viewmats must have shape [..., C, 4, 4]");
+    TORCH_CHECK(Ks.dim() == means.dim() + 1, "Ks must have shape [..., C, 3, 3]");
+    TORCH_CHECK(viewmats.size(-2) == 4 && viewmats.size(-1) == 4, "viewmats last two dimensions must be 4x4");
+    TORCH_CHECK(Ks.size(-2) == 3 && Ks.size(-1) == 3, "Ks last two dimensions must be 3x3");
+    TORCH_CHECK(
+        viewmats.sizes().slice(0, viewmats.dim() - 3) == means.sizes().slice(0, means.dim() - 2),
+        "means and viewmats batch dimensions must match");
+    TORCH_CHECK(
+        Ks.sizes().slice(0, Ks.dim() - 3) == means.sizes().slice(0, means.dim() - 2),
+        "means and Ks batch dimensions must match");
+    TORCH_CHECK(viewmats.size(-3) == Ks.size(-3), "viewmats and Ks camera dimension must match");
+    TORCH_CHECK(image_width >= 0, "image_width must be non-negative");
+    TORCH_CHECK(image_height >= 0, "image_height must be non-negative");
+    check_camera_model(camera_model);
+}
+
+void validate_covars(const at::Tensor& covars, const at::Tensor& means) {
+    check_mps_float32(covars, "covars");
+    TORCH_CHECK(
+        covars.sizes().slice(0, covars.dim() - 2) == means.sizes().slice(0, means.dim() - 2) &&
+            covars.size(-2) == means.size(-2) && covars.size(-1) == 6,
+        "covars must have shape [..., N, 6]");
+}
+
+void validate_quats_scales(
+    const at::Tensor& quats,
+    const at::Tensor& scales,
+    const at::Tensor& means
+) {
+    check_mps_float32(quats, "quats");
+    check_mps_float32(scales, "scales");
+    TORCH_CHECK(
+        quats.sizes().slice(0, quats.dim() - 2) == means.sizes().slice(0, means.dim() - 2) &&
+            quats.size(-2) == means.size(-2) && quats.size(-1) == 4,
+        "quats must have shape [..., N, 4]");
+    TORCH_CHECK(
+        scales.sizes().slice(0, scales.dim() - 2) == means.sizes().slice(0, means.dim() - 2) &&
+            scales.size(-2) == means.size(-2) && scales.size(-1) == 3,
+        "scales must have shape [..., N, 3]");
+}
+
+void validate_opacities(const at::Tensor& opacities, const at::Tensor& means) {
+    check_mps_float32(opacities, "opacities");
+    TORCH_CHECK(
+        opacities.sizes().slice(0, opacities.dim() - 1) == means.sizes().slice(0, means.dim() - 2) &&
+            opacities.size(-1) == means.size(-2),
+        "opacities must have shape [..., N]");
+}
+
+at::DimVector make_radii_shape(const at::Tensor& means, const at::Tensor& viewmats) {
+    at::DimVector shape(means.sizes().slice(0, means.dim() - 2));
+    shape.push_back(viewmats.size(-3));
+    shape.push_back(means.size(-2));
+    shape.push_back(2);
+    return shape;
+}
+
+at::DimVector make_means2d_shape(const at::Tensor& means, const at::Tensor& viewmats) {
+    return make_radii_shape(means, viewmats);
+}
+
+at::DimVector make_depths_shape(const at::Tensor& means, const at::Tensor& viewmats) {
+    at::DimVector shape(means.sizes().slice(0, means.dim() - 2));
+    shape.push_back(viewmats.size(-3));
+    shape.push_back(means.size(-2));
+    return shape;
+}
+
+at::DimVector make_conics_shape(const at::Tensor& means, const at::Tensor& viewmats) {
+    at::DimVector shape(means.sizes().slice(0, means.dim() - 2));
+    shape.push_back(viewmats.size(-3));
+    shape.push_back(means.size(-2));
+    shape.push_back(3);
+    return shape;
+}
+
+at::DimVector make_triu_shape(const at::Tensor& means) {
+    at::DimVector shape(means.sizes().slice(0, means.dim() - 2));
+    shape.push_back(means.size(-2));
+    shape.push_back(6);
+    return shape;
+}
+
+at::DimVector make_quat_shape(const at::Tensor& means) {
+    at::DimVector shape(means.sizes().slice(0, means.dim() - 2));
+    shape.push_back(means.size(-2));
+    shape.push_back(4);
+    return shape;
+}
+
+at::DimVector make_scale_shape(const at::Tensor& means) {
+    at::DimVector shape(means.sizes().slice(0, means.dim() - 2));
+    shape.push_back(means.size(-2));
+    shape.push_back(3);
+    return shape;
+}
+
+// ATen counterparts of the MSL helpers load_mat3_triu (metal_math.h) and
+// store_symmetric_matrix (projection_math.h).  They perform the same
+// [c00,c01,c02,c11,c12,c22] ↔ 3×3 symmetric matrix conversion on the CPU/MPS
+// side to prepare tensors for the Metal kernel and the ATen reference.
+at::Tensor covars_triu_to_full(const at::Tensor& covars) {
+    auto parts = at::unbind(covars, -1);
+    at::Tensor row0 = at::stack({parts[0], parts[1], parts[2]}, -1);
+    at::Tensor row1 = at::stack({parts[1], parts[3], parts[4]}, -1);
+    at::Tensor row2 = at::stack({parts[2], parts[4], parts[5]}, -1);
+    return at::stack({row0, row1, row2}, -2);
+}
+
+at::Tensor covars_full_to_triu(const at::Tensor& covars) {
+    return at::stack(
+        {
+            covars.index({Ellipsis, 0, 0}),
+            covars.index({Ellipsis, 0, 1}),
+            covars.index({Ellipsis, 0, 2}),
+            covars.index({Ellipsis, 1, 1}),
+            covars.index({Ellipsis, 1, 2}),
+            covars.index({Ellipsis, 2, 2}),
+        },
+        -1);
+}
+
+at::Tensor quat_to_rotmat_reference(const at::Tensor& quats) {
+    at::Tensor quats_norm = quats / at::linalg_vector_norm(quats, 2.0, {-1}, true);
+    auto parts = at::unbind(quats_norm, -1);
+    const at::Tensor& w = parts[0];
+    const at::Tensor& x = parts[1];
+    const at::Tensor& y = parts[2];
+    const at::Tensor& z = parts[3];
+    at::Tensor R = at::stack(
+        {
+            1 - 2 * (y * y + z * z),
+            2 * (x * y - w * z),
+            2 * (x * z + w * y),
+            2 * (x * y + w * z),
+            1 - 2 * (x * x + z * z),
+            2 * (y * z - w * x),
+            2 * (x * z - w * y),
+            2 * (y * z + w * x),
+            1 - 2 * (x * x + y * y),
+        },
+        -1);
+    at::DimVector shape(quats.sizes().slice(0, quats.dim() - 1));
+    shape.push_back(3);
+    shape.push_back(3);
+    return R.reshape(shape);
+}
+
+at::Tensor quat_scale_to_covar_reference(
+    const at::Tensor& quats,
+    const at::Tensor& scales
+) {
+    at::Tensor R = quat_to_rotmat_reference(quats);
+    at::Tensor M = R * scales.unsqueeze(-2);
+    return at::einsum("...ij,...kj->...ik", {M, M});
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, c10::optional<at::Tensor>>
+projection_ewa_3dgs_fused_reference_forward(
+    const at::Tensor& means,
+    const at::Tensor& covars_full,
+    const at::Tensor& viewmats,
+    const at::Tensor& Ks,
+    int64_t image_width,
+    int64_t image_height,
+    double eps2d,
+    int64_t camera_model,
+    bool calc_compensations
+) {
+    at::Tensor R = viewmats.index({Ellipsis, Slice(None, 3), Slice(None, 3)});
+    at::Tensor t = viewmats.index({Ellipsis, Slice(None, 3), 3});
+    at::Tensor means_c = at::einsum("...cij,...nj->...cni", {R, means}) + t.unsqueeze(-2);
+    at::Tensor covars_c = at::einsum("...cij,...njk,...clk->...cnil", {R, covars_full, R});
+
+    at::Tensor fx = Ks.index({Ellipsis, 0, 0}).unsqueeze(-1);
+    at::Tensor fy = Ks.index({Ellipsis, 1, 1}).unsqueeze(-1);
+    at::Tensor cx = Ks.index({Ellipsis, 0, 2}).unsqueeze(-1);
+    at::Tensor cy = Ks.index({Ellipsis, 1, 2}).unsqueeze(-1);
+
+    at::Tensor means2d;
+    at::Tensor covars2d;
+    if (camera_model == kCameraModelOrtho) {
+        at::Tensor zeros = at::zeros_like(fx);
+        at::DimVector Jshape(fx.sizes());
+        Jshape.push_back(2);
+        Jshape.push_back(3);
+        at::Tensor J = at::stack({fx, zeros, zeros, zeros, fy, zeros}, -1).reshape(Jshape);
+        std::vector<int64_t> repeats(J.dim(), 1);
+        repeats[J.dim() - 3] = means.size(-2);
+        J = J.repeat(repeats);
+        covars2d = at::einsum("...ij,...jk,...kl->...il", {J, covars_c, J.transpose(-1, -2)});
+
+        at::Tensor scales2d =
+            at::stack({Ks.index({Ellipsis, 0, 0}), Ks.index({Ellipsis, 1, 1})}, -1).unsqueeze(-2);
+        at::Tensor offsets2d =
+            at::stack({Ks.index({Ellipsis, 0, 2}), Ks.index({Ellipsis, 1, 2})}, -1).unsqueeze(-2);
+        means2d = means_c.index({Ellipsis, Slice(None, 2)}) * scales2d + offsets2d;
+    } else if (camera_model == kCameraModelFisheye) {
+        at::Tensor x = means_c.index({Ellipsis, 0});
+        at::Tensor y = means_c.index({Ellipsis, 1});
+        at::Tensor z = means_c.index({Ellipsis, 2});
+        at::Tensor eps = at::full({}, 1e-7, means.options());
+        at::Tensor xy_len = at::sqrt(x * x + y * y) + eps;
+        at::Tensor theta = at::atan2(xy_len, z + eps);
+        means2d = at::stack(
+            {
+                x * fx * theta / xy_len + cx,
+                y * fy * theta / xy_len + cy,
+            },
+            -1);
+
+        at::Tensor x2 = x * x + eps;
+        at::Tensor y2 = y * y;
+        at::Tensor xy = x * y;
+        at::Tensor x2y2 = x2 + y2;
+        at::Tensor x2y2z2_inv = 1.0 / (x2y2 + z * z);
+        at::Tensor b = at::atan2(xy_len, z) / xy_len / x2y2;
+        at::Tensor a = z * x2y2z2_inv / x2y2;
+        at::DimVector Jshape(means_c.sizes().slice(0, means_c.dim() - 1));
+        Jshape.push_back(2);
+        Jshape.push_back(3);
+        at::Tensor J = at::stack(
+                           {
+                               fx * (x2 * a + y2 * b),
+                               fx * xy * (a - b),
+                               -fx * x * x2y2z2_inv,
+                               fy * xy * (a - b),
+                               fy * (y2 * a + x2 * b),
+                               -fy * y * x2y2z2_inv,
+                           },
+                           -1)
+                           .reshape(Jshape);
+        covars2d = at::einsum("...ij,...jk,...kl->...il", {J, covars_c, J.transpose(-1, -2)});
+    } else {
+        at::Tensor tx = means_c.index({Ellipsis, 0});
+        at::Tensor ty = means_c.index({Ellipsis, 1});
+        at::Tensor tz = means_c.index({Ellipsis, 2});
+        at::Tensor tz2 = tz * tz;
+        at::Tensor tan_fovx = 0.5 * static_cast<double>(image_width) / fx;
+        at::Tensor tan_fovy = 0.5 * static_cast<double>(image_height) / fy;
+        at::Tensor lim_x_pos = (static_cast<double>(image_width) - cx) / fx + 0.3 * tan_fovx;
+        at::Tensor lim_x_neg = cx / fx + 0.3 * tan_fovx;
+        at::Tensor lim_y_pos = (static_cast<double>(image_height) - cy) / fy + 0.3 * tan_fovy;
+        at::Tensor lim_y_neg = cy / fy + 0.3 * tan_fovy;
+        tx = tz * at::clamp(tx / tz, -lim_x_neg, lim_x_pos);
+        ty = tz * at::clamp(ty / tz, -lim_y_neg, lim_y_pos);
+
+        at::Tensor zeros = at::zeros_like(tx);
+        at::DimVector Jshape(means_c.sizes().slice(0, means_c.dim() - 1));
+        Jshape.push_back(2);
+        Jshape.push_back(3);
+        at::Tensor J = at::stack(
+                           {fx / tz, zeros, -fx * tx / tz2, zeros, fy / tz, -fy * ty / tz2},
+                           -1)
+                           .reshape(Jshape);
+        covars2d = at::einsum("...ij,...jk,...kl->...il", {J, covars_c, J.transpose(-1, -2)});
+        means2d = at::einsum(
+                      "...ij,...nj->...ni",
+                      {Ks.index({Ellipsis, Slice(None, 2), Slice(None, 3)}), means_c}) /
+            tz.unsqueeze(-1);
+    }
+
+    at::Tensor det_orig =
+        covars2d.index({Ellipsis, 0, 0}) * covars2d.index({Ellipsis, 1, 1}) -
+        covars2d.index({Ellipsis, 0, 1}) * covars2d.index({Ellipsis, 1, 0});
+    at::Tensor covars2d_blur =
+        covars2d + at::eye(2, means.options()) * eps2d;
+    at::Tensor det_blur =
+        covars2d_blur.index({Ellipsis, 0, 0}) * covars2d_blur.index({Ellipsis, 1, 1}) -
+        covars2d_blur.index({Ellipsis, 0, 1}) * covars2d_blur.index({Ellipsis, 1, 0});
+    at::Tensor safe_det_blur = det_blur.clamp_min(1e-10);
+
+    c10::optional<at::Tensor> compensations = c10::nullopt;
+    if (calc_compensations) {
+        compensations = at::sqrt(
+            (det_orig / safe_det_blur).clamp_min(kMinCompensation * kMinCompensation));
+    }
+
+    at::Tensor conics = at::stack(
+        {
+            covars2d_blur.index({Ellipsis, 1, 1}) / safe_det_blur,
+            -(covars2d_blur.index({Ellipsis, 0, 1}) + covars2d_blur.index({Ellipsis, 1, 0})) /
+                2.0 / safe_det_blur,
+            covars2d_blur.index({Ellipsis, 0, 0}) / safe_det_blur,
+        },
+        -1);
+    at::Tensor depths = means_c.index({Ellipsis, 2});
+    at::Tensor radius_x =
+        at::ceil(kGaussianExtend * at::sqrt(covars2d_blur.index({Ellipsis, 0, 0}).clamp_min(0.0)));
+    at::Tensor radius_y =
+        at::ceil(kGaussianExtend * at::sqrt(covars2d_blur.index({Ellipsis, 1, 1}).clamp_min(0.0)));
+    at::Tensor radius = at::stack({radius_x, radius_y}, -1);
+    at::Tensor radii = radius.to(at::kInt);
+    return std::make_tuple(radii, means2d, depths, conics, compensations);
+}
+
+}  // namespace
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, c10::optional<at::Tensor>>
+projection_ewa_3dgs_fused_fwd_op(
+    const at::Tensor& means,
+    const c10::optional<at::Tensor>& covars,
+    const c10::optional<at::Tensor>& quats,
+    const c10::optional<at::Tensor>& scales,
+    const c10::optional<at::Tensor>& opacities,
+    const at::Tensor& viewmats,
+    const at::Tensor& Ks,
+    int64_t image_width,
+    int64_t image_height,
+    double eps2d,
+    double near_plane,
+    double far_plane,
+    double radius_clip,
+    bool calc_compensations,
+    int64_t camera_model
+) {
+    validate_forward_common(means, viewmats, Ks, image_width, image_height, camera_model);
+    TORCH_CHECK(
+        covars.has_value() ^ (quats.has_value() && scales.has_value()),
+        "must provide either covars or {quats, scales}");
+    if (covars.has_value()) {
+        validate_covars(*covars, means);
+    } else {
+        validate_quats_scales(*quats, *scales, means);
+    }
+    if (opacities.has_value()) {
+        validate_opacities(*opacities, means);
+    }
+
+    at::Tensor covars_full;
+    if (covars.has_value()) {
+        covars_full = covars_triu_to_full(*covars);
+    } else {
+        auto covar_out = quat_scale_to_covar_preci_fwd_op(*quats, *scales, true, false, false);
+        covars_full = std::get<0>(covar_out).value();
+    }
+    at::Tensor covars_triu = covars_full_to_triu(covars_full).contiguous();
+
+    at::Tensor radii = at::empty(make_radii_shape(means, viewmats), means.options().dtype(at::kInt));
+    at::Tensor means2d = at::empty(make_means2d_shape(means, viewmats), means.options());
+    at::Tensor depths = at::empty(make_depths_shape(means, viewmats), means.options());
+    at::Tensor conics = at::empty(make_conics_shape(means, viewmats), means.options());
+    c10::optional<at::Tensor> compensations = c10::nullopt;
+    if (calc_compensations) {
+        compensations = at::empty(make_depths_shape(means, viewmats), means.options());
+    }
+
+    const uint32_t B = static_cast<uint32_t>(means.numel() / (means.size(-2) * 3));
+    const uint32_t C = static_cast<uint32_t>(viewmats.size(-3));
+    const uint32_t N = static_cast<uint32_t>(means.size(-2));
+    const uint32_t n = B * C * N;
+    if (n == 0u) {
+        return std::make_tuple(radii, means2d, depths, conics, compensations);
+    }
+
+    auto& ctx = MetalContext::instance();
+    id<MTLComputePipelineState> pso = ctx.pipeline("projection_ewa_3dgs_fused_fwd_kernel");
+    auto* mps_stream = at::mps::getCurrentMPSStream();
+    TORCH_CHECK(mps_stream != nullptr, "Failed to acquire current MPS stream");
+
+    const uint32_t image_width_u32 = static_cast<uint32_t>(image_width);
+    const uint32_t image_height_u32 = static_cast<uint32_t>(image_height);
+    const float eps2d_f = static_cast<float>(eps2d);
+    const float near_plane_f = static_cast<float>(near_plane);
+    const float far_plane_f = static_cast<float>(far_plane);
+    const float radius_clip_f = static_cast<float>(radius_clip);
+    const uint32_t camera_model_u32 = static_cast<uint32_t>(camera_model);
+    const uint32_t has_opacities = opacities.has_value() ? 1u : 0u;
+    const uint32_t has_compensations = calc_compensations ? 1u : 0u;
+
+    at::mps::dispatch_sync_with_rethrow(mps_stream->queue(), ^() {
+        @autoreleasepool {
+            id<MTLComputeCommandEncoder> enc = mps_stream->commandEncoder();
+            TORCH_CHECK(enc != nil, "Failed to create MPS compute encoder");
+
+            [enc setComputePipelineState:pso];
+            [enc setBuffer:to_mtl_buffer(means) offset:byte_offset(means) atIndex:0];
+            [enc setBuffer:to_mtl_buffer(covars_triu) offset:byte_offset(covars_triu) atIndex:1];
+            set_optional_tensor_buffer(enc, opacities.value_or(at::Tensor{}), 2);
+            [enc setBuffer:to_mtl_buffer(viewmats) offset:byte_offset(viewmats) atIndex:3];
+            [enc setBuffer:to_mtl_buffer(Ks) offset:byte_offset(Ks) atIndex:4];
+            [enc setBuffer:to_mtl_buffer(radii) offset:byte_offset(radii) atIndex:5];
+            [enc setBuffer:to_mtl_buffer(means2d) offset:byte_offset(means2d) atIndex:6];
+            [enc setBuffer:to_mtl_buffer(depths) offset:byte_offset(depths) atIndex:7];
+            [enc setBuffer:to_mtl_buffer(conics) offset:byte_offset(conics) atIndex:8];
+            set_optional_tensor_buffer(enc, compensations.value_or(at::Tensor{}), 9);
+            [enc setBytes:&B length:sizeof(B) atIndex:10];
+            [enc setBytes:&C length:sizeof(C) atIndex:11];
+            [enc setBytes:&N length:sizeof(N) atIndex:12];
+            [enc setBytes:&image_width_u32 length:sizeof(image_width_u32) atIndex:13];
+            [enc setBytes:&image_height_u32 length:sizeof(image_height_u32) atIndex:14];
+            [enc setBytes:&eps2d_f length:sizeof(eps2d_f) atIndex:15];
+            [enc setBytes:&near_plane_f length:sizeof(near_plane_f) atIndex:16];
+            [enc setBytes:&far_plane_f length:sizeof(far_plane_f) atIndex:17];
+            [enc setBytes:&radius_clip_f length:sizeof(radius_clip_f) atIndex:18];
+            [enc setBytes:&camera_model_u32 length:sizeof(camera_model_u32) atIndex:19];
+            [enc setBytes:&has_opacities length:sizeof(has_opacities) atIndex:20];
+            [enc setBytes:&has_compensations length:sizeof(has_compensations) atIndex:21];
+
+            const uint32_t tg = static_cast<uint32_t>(pso.maxTotalThreadsPerThreadgroup);
+            const uint32_t threads = std::min(tg, n);
+            [enc dispatchThreads:MTLSizeMake(n, 1, 1)
+              threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+        }
+    });
+    mps_stream->synchronize(at::mps::SyncType::COMMIT);
+
+    return std::make_tuple(radii, means2d, depths, conics, compensations);
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+projection_ewa_3dgs_fused_bwd_op(
+    const at::Tensor& means,
+    const c10::optional<at::Tensor>& covars,
+    const c10::optional<at::Tensor>& quats,
+    const c10::optional<at::Tensor>& scales,
+    const at::Tensor& viewmats,
+    const at::Tensor& Ks,
+    int64_t image_width,
+    int64_t image_height,
+    double eps2d,
+    int64_t camera_model,
+    const at::Tensor& radii,
+    const at::Tensor& conics,
+    const c10::optional<at::Tensor>& compensations,
+    const at::Tensor& v_means2d,
+    const at::Tensor& v_depths,
+    const at::Tensor& v_conics,
+    const c10::optional<at::Tensor>& v_compensations,
+    bool viewmats_requires_grad
+) {
+    validate_forward_common(means, viewmats, Ks, image_width, image_height, camera_model);
+    check_mps_int32(radii, "radii");
+    check_mps_float32(conics, "conics");
+    check_mps_float32(v_means2d, "v_means2d");
+    check_mps_float32(v_depths, "v_depths");
+    check_mps_float32(v_conics, "v_conics");
+    TORCH_CHECK(
+        covars.has_value() ^ (quats.has_value() && scales.has_value()),
+        "must provide either covars or {quats, scales}");
+    if (covars.has_value()) {
+        validate_covars(*covars, means);
+    } else {
+        validate_quats_scales(*quats, *scales, means);
+    }
+    TORCH_CHECK(
+        radii.sizes().equals(make_radii_shape(means, viewmats)),
+        "radii shape must match forward output");
+    TORCH_CHECK(
+        conics.sizes().equals(make_conics_shape(means, viewmats)),
+        "conics shape must match forward output");
+    TORCH_CHECK(
+        v_means2d.sizes().equals(make_means2d_shape(means, viewmats)),
+        "v_means2d shape must match forward output");
+    TORCH_CHECK(
+        v_depths.sizes().equals(make_depths_shape(means, viewmats)),
+        "v_depths shape must match forward output");
+    TORCH_CHECK(
+        v_conics.sizes().equals(make_conics_shape(means, viewmats)),
+        "v_conics shape must match forward output");
+    if (compensations.has_value()) {
+        check_mps_float32(*compensations, "compensations");
+        TORCH_CHECK(
+            compensations->sizes().equals(make_depths_shape(means, viewmats)),
+            "compensations shape must match forward output");
+    }
+    if (v_compensations.has_value()) {
+        check_mps_float32(*v_compensations, "v_compensations");
+        TORCH_CHECK(
+            v_compensations->sizes().equals(make_depths_shape(means, viewmats)),
+            "v_compensations shape must match forward output");
+        TORCH_CHECK(compensations.has_value(), "v_compensations requires compensations to be defined");
+    }
+
+    // Backward is computed by differentiating through the ATen reference
+    // implementation (projection_ewa_3dgs_fused_reference_forward) rather than
+    // a dedicated Metal kernel.  This makes backward O(2 × reference_fwd_time)
+    // but is correct and avoids maintaining a hand-written VJP for all three
+    // camera models.  A native Metal backward kernel is deferred to a later
+    // milestone.
+    torch::autograd::AutoGradMode enable_grad(true);
+
+    at::Tensor means_req = means.detach().clone();
+    means_req.set_requires_grad(true);
+    at::Tensor viewmats_req = viewmats.detach().clone();
+    viewmats_req.set_requires_grad(viewmats_requires_grad);
+    at::Tensor Ks_detached = Ks.detach();
+
+    at::Tensor covars_full;
+    at::Tensor covars_req;
+    at::Tensor quats_req;
+    at::Tensor scales_req;
+    const bool use_covars = covars.has_value();
+    if (use_covars) {
+        covars_req = covars->detach().clone();
+        covars_req.set_requires_grad(true);
+        covars_full = covars_triu_to_full(covars_req);
+    } else {
+        quats_req = quats->detach().clone();
+        quats_req.set_requires_grad(true);
+        scales_req = scales->detach().clone();
+        scales_req.set_requires_grad(true);
+        covars_full = quat_scale_to_covar_reference(quats_req, scales_req);
+    }
+
+    auto ref_out = projection_ewa_3dgs_fused_reference_forward(
+        means_req,
+        covars_full,
+        viewmats_req,
+        Ks_detached,
+        image_width,
+        image_height,
+        eps2d,
+        camera_model,
+        compensations.has_value());
+    at::Tensor means2d_ref = std::get<1>(ref_out);
+    at::Tensor depths_ref = std::get<2>(ref_out);
+    at::Tensor conics_ref = std::get<3>(ref_out);
+    c10::optional<at::Tensor> compensations_ref = std::get<4>(ref_out);
+
+    at::Tensor valid =
+        (radii.index({Ellipsis, 0}) > 0) &
+        (radii.index({Ellipsis, 1}) > 0);
+
+    std::vector<at::Tensor> outputs = {means2d_ref, depths_ref, conics_ref};
+    std::vector<at::Tensor> grad_outputs = {
+        v_means2d * valid.unsqueeze(-1).to(v_means2d.scalar_type()),
+        v_depths * valid.to(v_depths.scalar_type()),
+        v_conics * valid.unsqueeze(-1).to(v_conics.scalar_type()),
+    };
+    if (compensations_ref.has_value() && v_compensations.has_value()) {
+        outputs.push_back(*compensations_ref);
+        grad_outputs.push_back(*v_compensations * valid.to(v_compensations->scalar_type()));
+    }
+
+    std::vector<at::Tensor> inputs = {means_req};
+    if (use_covars) {
+        inputs.push_back(covars_req);
+    } else {
+        inputs.push_back(quats_req);
+        inputs.push_back(scales_req);
+    }
+    if (viewmats_requires_grad) {
+        inputs.push_back(viewmats_req);
+    }
+
+    std::vector<at::Tensor> grad_inputs =
+        torch::autograd::grad(outputs, inputs, grad_outputs, false, false, true);
+
+    at::Tensor v_means = grad_inputs[0];
+    at::Tensor v_covars = covars.has_value()
+        ? at::zeros_like(*covars)
+        : at::zeros(make_triu_shape(means), means.options());
+    at::Tensor v_quats = quats.has_value()
+        ? at::zeros_like(*quats)
+        : at::zeros(make_quat_shape(means), means.options());
+    at::Tensor v_scales = scales.has_value()
+        ? at::zeros_like(*scales)
+        : at::zeros(make_scale_shape(means), means.options());
+    at::Tensor v_viewmats = at::zeros_like(viewmats);
+
+    int64_t next_grad = 1;
+    if (use_covars) {
+        if (grad_inputs[next_grad].defined()) {
+            v_covars = grad_inputs[next_grad];
+        }
+        ++next_grad;
+    } else {
+        if (grad_inputs[next_grad].defined()) {
+            v_quats = grad_inputs[next_grad];
+        }
+        ++next_grad;
+        if (grad_inputs[next_grad].defined()) {
+            v_scales = grad_inputs[next_grad];
+        }
+        ++next_grad;
+    }
+    if (viewmats_requires_grad && next_grad < static_cast<int64_t>(grad_inputs.size()) &&
+        grad_inputs[next_grad].defined()) {
+        v_viewmats = grad_inputs[next_grad];
+    }
+
+    return std::make_tuple(v_means, v_covars, v_quats, v_scales, v_viewmats);
+}
+
+}  // namespace gsplat::metal

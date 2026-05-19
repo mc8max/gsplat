@@ -5,6 +5,7 @@
 
 from gsplat.cuda._math import _quat_scale_to_covar_preci
 from gsplat.cuda._torch_impl import (
+    _fully_fused_projection,
     _fisheye_proj,
     _isect_tiles,
     _isect_offset_encode,
@@ -14,6 +15,7 @@ from gsplat.cuda._torch_impl import (
 )
 
 __all__ = [
+    "_fully_fused_projection",
     "_fisheye_proj",
     "_isect_tiles",
     "_isect_offset_encode",
