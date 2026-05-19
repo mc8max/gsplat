@@ -527,113 +527,138 @@ projection_ewa_3dgs_fused_bwd_op(
         TORCH_CHECK(compensations.has_value(), "v_compensations requires compensations to be defined");
     }
 
-    // Backward is computed by differentiating through the ATen reference
-    // implementation (projection_ewa_3dgs_fused_reference_forward) rather than
-    // a dedicated Metal kernel.  This makes backward O(2 × reference_fwd_time)
-    // but is correct and avoids maintaining a hand-written VJP for all three
-    // camera models.  A native Metal backward kernel is deferred to a later
-    // milestone.
-    torch::autograd::AutoGradMode enable_grad(true);
-
-    at::Tensor means_req = means.detach().clone();
-    means_req.set_requires_grad(true);
-    at::Tensor viewmats_req = viewmats.detach().clone();
-    viewmats_req.set_requires_grad(viewmats_requires_grad);
-    at::Tensor Ks_detached = Ks.detach();
-
-    at::Tensor covars_full;
-    at::Tensor covars_req;
-    at::Tensor quats_req;
-    at::Tensor scales_req;
     const bool use_covars = covars.has_value();
+    const uint32_t B = static_cast<uint32_t>(means.numel() / (means.size(-2) * 3));
+    const uint32_t C = static_cast<uint32_t>(viewmats.size(-3));
+    const uint32_t N = static_cast<uint32_t>(means.size(-2));
+    const uint32_t n = B * C * N;
+
+    at::DimVector tmp_means_shape(means.sizes().slice(0, means.dim() - 2));
+    tmp_means_shape.push_back(viewmats.size(-3));
+    tmp_means_shape.push_back(means.size(-2));
+    tmp_means_shape.push_back(3);
+    at::Tensor tmp_means = at::zeros(tmp_means_shape, means.options());
+
+    c10::optional<at::Tensor> tmp_covars = c10::nullopt;
+    c10::optional<at::Tensor> tmp_quats = c10::nullopt;
+    c10::optional<at::Tensor> tmp_scales = c10::nullopt;
+    c10::optional<at::Tensor> tmp_viewmats = c10::nullopt;
     if (use_covars) {
-        covars_req = covars->detach().clone();
-        covars_req.set_requires_grad(true);
-        covars_full = covars_triu_to_full(covars_req);
+        at::DimVector shape(means.sizes().slice(0, means.dim() - 2));
+        shape.push_back(viewmats.size(-3));
+        shape.push_back(means.size(-2));
+        shape.push_back(6);
+        tmp_covars = at::zeros(shape, means.options());
     } else {
-        quats_req = quats->detach().clone();
-        quats_req.set_requires_grad(true);
-        scales_req = scales->detach().clone();
-        scales_req.set_requires_grad(true);
-        covars_full = quat_scale_to_covar_reference(quats_req, scales_req);
-    }
+        at::DimVector quat_shape(means.sizes().slice(0, means.dim() - 2));
+        quat_shape.push_back(viewmats.size(-3));
+        quat_shape.push_back(means.size(-2));
+        quat_shape.push_back(4);
+        tmp_quats = at::zeros(quat_shape, means.options());
 
-    auto ref_out = projection_ewa_3dgs_fused_reference_forward(
-        means_req,
-        covars_full,
-        viewmats_req,
-        Ks_detached,
-        image_width,
-        image_height,
-        eps2d,
-        camera_model,
-        compensations.has_value());
-    at::Tensor means2d_ref = std::get<1>(ref_out);
-    at::Tensor depths_ref = std::get<2>(ref_out);
-    at::Tensor conics_ref = std::get<3>(ref_out);
-    c10::optional<at::Tensor> compensations_ref = std::get<4>(ref_out);
-
-    at::Tensor valid =
-        (radii.index({Ellipsis, 0}) > 0) &
-        (radii.index({Ellipsis, 1}) > 0);
-
-    std::vector<at::Tensor> outputs = {means2d_ref, depths_ref, conics_ref};
-    std::vector<at::Tensor> grad_outputs = {
-        v_means2d * valid.unsqueeze(-1).to(v_means2d.scalar_type()),
-        v_depths * valid.to(v_depths.scalar_type()),
-        v_conics * valid.unsqueeze(-1).to(v_conics.scalar_type()),
-    };
-    if (compensations_ref.has_value() && v_compensations.has_value()) {
-        outputs.push_back(*compensations_ref);
-        grad_outputs.push_back(*v_compensations * valid.to(v_compensations->scalar_type()));
-    }
-
-    std::vector<at::Tensor> inputs = {means_req};
-    if (use_covars) {
-        inputs.push_back(covars_req);
-    } else {
-        inputs.push_back(quats_req);
-        inputs.push_back(scales_req);
+        at::DimVector scale_shape(means.sizes().slice(0, means.dim() - 2));
+        scale_shape.push_back(viewmats.size(-3));
+        scale_shape.push_back(means.size(-2));
+        scale_shape.push_back(3);
+        tmp_scales = at::zeros(scale_shape, means.options());
     }
     if (viewmats_requires_grad) {
-        inputs.push_back(viewmats_req);
+        at::DimVector viewmat_shape(means.sizes().slice(0, means.dim() - 2));
+        viewmat_shape.push_back(viewmats.size(-3));
+        viewmat_shape.push_back(means.size(-2));
+        viewmat_shape.push_back(4);
+        viewmat_shape.push_back(4);
+        tmp_viewmats = at::zeros(viewmat_shape, means.options());
     }
 
-    std::vector<at::Tensor> grad_inputs =
-        torch::autograd::grad(outputs, inputs, grad_outputs, false, false, true);
+    if (n == 0u) {
+        at::Tensor v_means = at::zeros_like(means);
+        at::Tensor v_covars = covars.has_value()
+            ? at::zeros_like(*covars)
+            : at::zeros(make_triu_shape(means), means.options());
+        at::Tensor v_quats = quats.has_value()
+            ? at::zeros_like(*quats)
+            : at::zeros(make_quat_shape(means), means.options());
+        at::Tensor v_scales = scales.has_value()
+            ? at::zeros_like(*scales)
+            : at::zeros(make_scale_shape(means), means.options());
+        at::Tensor v_viewmats = at::zeros_like(viewmats);
+        return std::make_tuple(v_means, v_covars, v_quats, v_scales, v_viewmats);
+    }
 
-    at::Tensor v_means = grad_inputs[0];
+    auto& ctx = MetalContext::instance();
+    id<MTLComputePipelineState> pso = ctx.pipeline("projection_ewa_3dgs_fused_bwd_kernel");
+    auto* mps_stream = at::mps::getCurrentMPSStream();
+    TORCH_CHECK(mps_stream != nullptr, "Failed to acquire current MPS stream");
+
+    const uint32_t image_width_u32 = static_cast<uint32_t>(image_width);
+    const uint32_t image_height_u32 = static_cast<uint32_t>(image_height);
+    const float eps2d_f = static_cast<float>(eps2d);
+    const uint32_t camera_model_u32 = static_cast<uint32_t>(camera_model);
+    const uint32_t use_covars_u32 = use_covars ? 1u : 0u;
+    const uint32_t has_compensations_u32 = compensations.has_value() ? 1u : 0u;
+    const uint32_t viewmats_requires_grad_u32 = viewmats_requires_grad ? 1u : 0u;
+
+    at::mps::dispatch_sync_with_rethrow(mps_stream->queue(), ^() {
+        @autoreleasepool {
+            id<MTLComputeCommandEncoder> enc = mps_stream->commandEncoder();
+            TORCH_CHECK(enc != nil, "Failed to create MPS compute encoder");
+
+            [enc setComputePipelineState:pso];
+            [enc setBuffer:to_mtl_buffer(means) offset:byte_offset(means) atIndex:0];
+            set_optional_tensor_buffer(enc, covars.value_or(at::Tensor{}), 1);
+            set_optional_tensor_buffer(enc, quats.value_or(at::Tensor{}), 2);
+            set_optional_tensor_buffer(enc, scales.value_or(at::Tensor{}), 3);
+            [enc setBuffer:to_mtl_buffer(viewmats) offset:byte_offset(viewmats) atIndex:4];
+            [enc setBuffer:to_mtl_buffer(Ks) offset:byte_offset(Ks) atIndex:5];
+            [enc setBuffer:to_mtl_buffer(radii) offset:byte_offset(radii) atIndex:6];
+            [enc setBuffer:to_mtl_buffer(conics) offset:byte_offset(conics) atIndex:7];
+            set_optional_tensor_buffer(enc, compensations.value_or(at::Tensor{}), 8);
+            [enc setBuffer:to_mtl_buffer(v_means2d) offset:byte_offset(v_means2d) atIndex:9];
+            [enc setBuffer:to_mtl_buffer(v_depths) offset:byte_offset(v_depths) atIndex:10];
+            [enc setBuffer:to_mtl_buffer(v_conics) offset:byte_offset(v_conics) atIndex:11];
+            set_optional_tensor_buffer(enc, v_compensations.value_or(at::Tensor{}), 12);
+            [enc setBuffer:to_mtl_buffer(tmp_means) offset:byte_offset(tmp_means) atIndex:13];
+            set_optional_tensor_buffer(enc, tmp_covars.value_or(at::Tensor{}), 14);
+            set_optional_tensor_buffer(enc, tmp_quats.value_or(at::Tensor{}), 15);
+            set_optional_tensor_buffer(enc, tmp_scales.value_or(at::Tensor{}), 16);
+            set_optional_tensor_buffer(enc, tmp_viewmats.value_or(at::Tensor{}), 17);
+            [enc setBytes:&B length:sizeof(B) atIndex:18];
+            [enc setBytes:&C length:sizeof(C) atIndex:19];
+            [enc setBytes:&N length:sizeof(N) atIndex:20];
+            [enc setBytes:&image_width_u32 length:sizeof(image_width_u32) atIndex:21];
+            [enc setBytes:&image_height_u32 length:sizeof(image_height_u32) atIndex:22];
+            [enc setBytes:&eps2d_f length:sizeof(eps2d_f) atIndex:23];
+            [enc setBytes:&camera_model_u32 length:sizeof(camera_model_u32) atIndex:24];
+            [enc setBytes:&use_covars_u32 length:sizeof(use_covars_u32) atIndex:25];
+            [enc setBytes:&has_compensations_u32 length:sizeof(has_compensations_u32) atIndex:26];
+            [enc setBytes:&viewmats_requires_grad_u32 length:sizeof(viewmats_requires_grad_u32) atIndex:27];
+
+            const uint32_t tg = static_cast<uint32_t>(pso.maxTotalThreadsPerThreadgroup);
+            const uint32_t threads = std::min(tg, n);
+            [enc dispatchThreads:MTLSizeMake(n, 1, 1)
+              threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+        }
+    });
+    // COMMIT (not COMMIT_AND_WAIT) is sufficient because all consumers of
+    // tmp_* tensors (the sum(-3) calls below) are MPS operations on the same
+    // stream and are automatically serialised.  Do not read tmp_* on CPU
+    // between here and the sum(-3) calls.
+    mps_stream->synchronize(at::mps::SyncType::COMMIT);
+
+    at::Tensor v_means = tmp_means.sum(-3);
     at::Tensor v_covars = covars.has_value()
-        ? at::zeros_like(*covars)
+        ? tmp_covars.value().sum(-3)
         : at::zeros(make_triu_shape(means), means.options());
     at::Tensor v_quats = quats.has_value()
-        ? at::zeros_like(*quats)
+        ? tmp_quats.value().sum(-3)
         : at::zeros(make_quat_shape(means), means.options());
     at::Tensor v_scales = scales.has_value()
-        ? at::zeros_like(*scales)
+        ? tmp_scales.value().sum(-3)
         : at::zeros(make_scale_shape(means), means.options());
-    at::Tensor v_viewmats = at::zeros_like(viewmats);
-
-    int64_t next_grad = 1;
-    if (use_covars) {
-        if (grad_inputs[next_grad].defined()) {
-            v_covars = grad_inputs[next_grad];
-        }
-        ++next_grad;
-    } else {
-        if (grad_inputs[next_grad].defined()) {
-            v_quats = grad_inputs[next_grad];
-        }
-        ++next_grad;
-        if (grad_inputs[next_grad].defined()) {
-            v_scales = grad_inputs[next_grad];
-        }
-        ++next_grad;
-    }
-    if (viewmats_requires_grad && next_grad < static_cast<int64_t>(grad_inputs.size()) &&
-        grad_inputs[next_grad].defined()) {
-        v_viewmats = grad_inputs[next_grad];
-    }
+    at::Tensor v_viewmats = viewmats_requires_grad
+        ? tmp_viewmats.value().sum(-3)
+        : at::zeros_like(viewmats);
 
     return std::make_tuple(v_means, v_covars, v_quats, v_scales, v_viewmats);
 }

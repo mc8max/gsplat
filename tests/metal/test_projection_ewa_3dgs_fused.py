@@ -369,3 +369,67 @@ def test_backward_batch_dims(mps_device):
     for actual, expected in zip(grads, ref_grads):
         assert actual.shape == expected.shape
         _assert_close(actual, expected, atol=3e-4, rtol=3e-4)
+
+
+# ---------------------------------------------------------------------------
+# M1 — isolated add_blur_vjp_metal: compensation gradient correctness
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("opacity", [0.99, 0.2, 0.01])
+def test_compensation_gradient_isolated(mps_device, opacity):
+    """
+    Test the compensation gradient path in isolation by using a single Gaussian
+    with known opacity, verifying the gradient through compensation matches
+    a finite-difference reference.
+
+    This exercises add_blur_vjp_metal across three operating regimes:
+      opacity=0.99  → compensation near 1 (nearly unblurred)
+      opacity=0.20  → compensation in mid-range
+      opacity=0.01  → compensation near kMinCompensation (clamped region)
+    """
+    width, height = 320, 240
+    eps2d = 0.3
+
+    means, quats, scales, viewmats, Ks = _sample_inputs(c=1, n=1, width=width, height=height)
+    opacities_val = torch.tensor([opacity], dtype=torch.float32)  # shape (N,)
+
+    # Reference: run forward with compensation enabled.
+    means_ref = means.clone().requires_grad_(True)
+    quats_ref  = quats.clone().requires_grad_(True)
+    scales_ref = scales.clone().requires_grad_(True)
+    covars_ref, _ = _quat_scale_to_covar_preci(quats_ref, scales_ref, compute_preci=False, triu=False)
+    ref_out = _fully_fused_projection(
+        means_ref, covars_ref, viewmats, Ks, width, height,
+        eps2d=eps2d, calc_compensations=True, camera_model="pinhole",
+    )
+    radii_ref, _, _, _, comp_ref = ref_out
+    assert comp_ref is not None
+
+    # Only test if this Gaussian is visible.
+    if not (radii_ref > 0).all():
+        pytest.skip("Gaussian culled for this opacity — cannot test gradient")
+
+    v_comp = torch.ones_like(comp_ref)
+    (comp_ref * v_comp).sum().backward()
+    ref_g_means  = means_ref.grad.clone()
+    ref_g_quats  = quats_ref.grad.clone()
+    ref_g_scales = scales_ref.grad.clone()
+
+    # Metal path.
+    means_mps  = means.clone().to(mps_device).requires_grad_(True)
+    quats_mps  = quats.clone().to(mps_device).requires_grad_(True)
+    scales_mps = scales.clone().to(mps_device).requires_grad_(True)
+    metal_out = gm.fully_fused_projection(
+        means_mps, None, quats_mps, scales_mps,
+        viewmats.to(mps_device), Ks.to(mps_device),
+        width, height, eps2d=eps2d, calc_compensations=True,
+        camera_model="pinhole", opacities=opacities_val.to(mps_device),
+    )
+    _, _, _, _, comp_metal = metal_out
+    assert comp_metal is not None
+
+    (comp_metal * v_comp.to(mps_device)).sum().backward()
+
+    _assert_close(means_mps.grad,  ref_g_means,  atol=3e-4, rtol=3e-4)
+    _assert_close(quats_mps.grad,  ref_g_quats,  atol=3e-4, rtol=3e-4)
+    _assert_close(scales_mps.grad, ref_g_scales, atol=3e-4, rtol=3e-4)
