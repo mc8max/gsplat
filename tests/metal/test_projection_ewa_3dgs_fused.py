@@ -42,6 +42,85 @@ def _sample_inputs(batch_shape=(), c=2, n=8, width=640, height=480):
     return means, quats, scales, viewmats, Ks
 
 
+def _fully_fused_projection_with_opacity_reference(
+    means: torch.Tensor,
+    quats: torch.Tensor,
+    scales: torch.Tensor,
+    viewmats: torch.Tensor,
+    Ks: torch.Tensor,
+    width: int,
+    height: int,
+    opacities: torch.Tensor,
+    eps2d: float = 0.3,
+    near_plane: float = 0.01,
+    far_plane: float = 1e10,
+    radius_clip: float = 0.0,
+    calc_compensations: bool = False,
+    camera_model: str = "pinhole",
+):
+    covars, _ = _quat_scale_to_covar_preci(
+        quats, scales, compute_covar=True, compute_preci=False, triu=False
+    )
+    radii, means2d, depths, conics, compensations = _fully_fused_projection(
+        means,
+        covars,
+        viewmats,
+        Ks,
+        width,
+        height,
+        eps2d=eps2d,
+        near_plane=near_plane,
+        far_plane=far_plane,
+        calc_compensations=calc_compensations,
+        camera_model=camera_model,
+    )
+
+    alpha_threshold = 1.0 / 255.0
+    gaussian_extend = 3.33
+    opacities_proj = torch.broadcast_to(opacities[..., None, :], depths.shape)
+    if compensations is not None:
+        opacities_proj = opacities_proj * compensations
+
+    covars2d_blur = torch.stack(
+        [
+            conics[..., 2],
+            -conics[..., 1],
+            -conics[..., 1],
+            conics[..., 0],
+        ],
+        dim=-1,
+    ).reshape(conics.shape[:-1] + (2, 2))
+    det_inv = conics[..., 0] * conics[..., 2] - conics[..., 1] * conics[..., 1]
+    covars2d_blur = covars2d_blur / det_inv[..., None, None]
+
+    extend = torch.full_like(depths, gaussian_extend)
+    positive = opacities_proj > alpha_threshold
+    opacity_extent = torch.zeros_like(opacities_proj)
+    opacity_extent[positive] = torch.sqrt(
+        torch.clamp(2.0 * torch.log(opacities_proj[positive] / alpha_threshold), min=0.0)
+    )
+    extend = torch.minimum(extend, opacity_extent)
+
+    radius_x = torch.ceil(extend * torch.sqrt(torch.clamp(covars2d_blur[..., 0, 0], min=0.0)))
+    radius_y = torch.ceil(extend * torch.sqrt(torch.clamp(covars2d_blur[..., 1, 1], min=0.0)))
+    radius = torch.stack([radius_x, radius_y], dim=-1)
+
+    valid = (depths >= near_plane) & (depths <= far_plane) & (opacities_proj >= alpha_threshold)
+    inside = (
+        (means2d[..., 0] + radius[..., 0] > 0)
+        & (means2d[..., 0] - radius[..., 0] < width)
+        & (means2d[..., 1] + radius[..., 1] > 0)
+        & (means2d[..., 1] - radius[..., 1] < height)
+    )
+    valid = valid & inside & ~(
+        (radius[..., 0] <= radius_clip) & (radius[..., 1] <= radius_clip)
+    )
+    radii = torch.where(valid[..., None], radius, torch.zeros_like(radius)).to(torch.int32)
+    if compensations is not None:
+        compensations = torch.where(valid, compensations, torch.zeros_like(compensations))
+    return radii, means2d, depths, conics, compensations
+
+
 @pytest.mark.parametrize("camera_model", ["pinhole", "ortho", "fisheye"])
 def test_forward_matches_reference_quat_scale(mps_device, camera_model):
     width, height = 640, 480
@@ -371,6 +450,62 @@ def test_backward_batch_dims(mps_device):
         _assert_close(actual, expected, atol=3e-4, rtol=3e-4)
 
 
+def test_backward_without_viewmat_grad(mps_device):
+    """Backward should not require viewmats gradients when viewmats has no grad."""
+    width, height = 640, 480
+    means, quats, scales, viewmats, Ks = _sample_inputs(c=2, n=6, width=width, height=height)
+
+    means_ref = means.clone().requires_grad_(True)
+    quats_ref = quats.clone().requires_grad_(True)
+    scales_ref = scales.clone().requires_grad_(True)
+    covars_ref, _ = _quat_scale_to_covar_preci(quats_ref, scales_ref, compute_preci=False, triu=False)
+    ref_radii, ref_means2d, ref_depths, ref_conics, _ = _fully_fused_projection(
+        means_ref,
+        covars_ref,
+        viewmats,
+        Ks,
+        width,
+        height,
+        calc_compensations=False,
+        camera_model="pinhole",
+    )
+    valid = (ref_radii > 0).all(dim=-1)
+    v_means2d = torch.randn_like(ref_means2d) * valid[..., None]
+    v_depths = torch.randn_like(ref_depths) * valid
+    v_conics = torch.randn_like(ref_conics) * valid[..., None]
+    ref_loss = (
+        (ref_means2d * v_means2d).sum()
+        + (ref_depths * v_depths).sum()
+        + (ref_conics * v_conics).sum()
+    )
+    ref_grads = torch.autograd.grad(ref_loss, (means_ref, quats_ref, scales_ref))
+
+    means_mps = means.clone().to(mps_device).requires_grad_(True)
+    quats_mps = quats.clone().to(mps_device).requires_grad_(True)
+    scales_mps = scales.clone().to(mps_device).requires_grad_(True)
+    out = gm.fully_fused_projection(
+        means_mps,
+        None,
+        quats_mps,
+        scales_mps,
+        viewmats.to(mps_device),
+        Ks.to(mps_device),
+        width,
+        height,
+        calc_compensations=False,
+        camera_model="pinhole",
+    )
+    loss = (
+        (out[1] * v_means2d.to(mps_device)).sum()
+        + (out[2] * v_depths.to(mps_device)).sum()
+        + (out[3] * v_conics.to(mps_device)).sum()
+    )
+    grads = torch.autograd.grad(loss, (means_mps, quats_mps, scales_mps))
+
+    for actual, expected in zip(grads, ref_grads):
+        _assert_close(actual, expected, atol=3e-4, rtol=3e-4)
+
+
 # ---------------------------------------------------------------------------
 # M1 — isolated add_blur_vjp_metal: compensation gradient correctness
 # ---------------------------------------------------------------------------
@@ -393,13 +528,12 @@ def test_compensation_gradient_isolated(mps_device, opacity):
     means, quats, scales, viewmats, Ks = _sample_inputs(c=1, n=1, width=width, height=height)
     opacities_val = torch.tensor([opacity], dtype=torch.float32)  # shape (N,)
 
-    # Reference: run forward with compensation enabled.
+    # Reference: run the same opacity-aware path with pure PyTorch math.
     means_ref = means.clone().requires_grad_(True)
     quats_ref  = quats.clone().requires_grad_(True)
     scales_ref = scales.clone().requires_grad_(True)
-    covars_ref, _ = _quat_scale_to_covar_preci(quats_ref, scales_ref, compute_preci=False, triu=False)
-    ref_out = _fully_fused_projection(
-        means_ref, covars_ref, viewmats, Ks, width, height,
+    ref_out = _fully_fused_projection_with_opacity_reference(
+        means_ref, quats_ref, scales_ref, viewmats, Ks, width, height, opacities_val,
         eps2d=eps2d, calc_compensations=True, camera_model="pinhole",
     )
     radii_ref, _, _, _, comp_ref = ref_out

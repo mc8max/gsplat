@@ -5,7 +5,6 @@
 
 #include <algorithm>
 #include <tuple>
-#include <vector>
 
 #include <torch/extension.h>
 
@@ -28,10 +27,6 @@ namespace {
 constexpr int64_t kCameraModelPinhole = 0;
 constexpr int64_t kCameraModelOrtho = 1;
 constexpr int64_t kCameraModelFisheye = 2;
-constexpr double kAlphaThreshold = 1.0 / 255.0;
-constexpr double kGaussianExtend = 3.33;
-constexpr double kMinCompensation = 0.25;
-
 void check_camera_model(int64_t camera_model) {
     TORCH_CHECK(
         camera_model == kCameraModelPinhole || camera_model == kCameraModelOrtho ||
@@ -150,10 +145,7 @@ at::DimVector make_scale_shape(const at::Tensor& means) {
     return shape;
 }
 
-// ATen counterparts of the MSL helpers load_mat3_triu (metal_math.h) and
-// store_symmetric_matrix (projection_math.h).  They perform the same
-// [c00,c01,c02,c11,c12,c22] ↔ 3×3 symmetric matrix conversion on the CPU/MPS
-// side to prepare tensors for the Metal kernel and the ATen reference.
+// Host-side symmetric-matrix packing helpers matching the Metal kernel layout.
 at::Tensor covars_triu_to_full(const at::Tensor& covars) {
     auto parts = at::unbind(covars, -1);
     at::Tensor row0 = at::stack({parts[0], parts[1], parts[2]}, -1);
@@ -173,180 +165,6 @@ at::Tensor covars_full_to_triu(const at::Tensor& covars) {
             covars.index({Ellipsis, 2, 2}),
         },
         -1);
-}
-
-at::Tensor quat_to_rotmat_reference(const at::Tensor& quats) {
-    at::Tensor quats_norm = quats / at::linalg_vector_norm(quats, 2.0, {-1}, true);
-    auto parts = at::unbind(quats_norm, -1);
-    const at::Tensor& w = parts[0];
-    const at::Tensor& x = parts[1];
-    const at::Tensor& y = parts[2];
-    const at::Tensor& z = parts[3];
-    at::Tensor R = at::stack(
-        {
-            1 - 2 * (y * y + z * z),
-            2 * (x * y - w * z),
-            2 * (x * z + w * y),
-            2 * (x * y + w * z),
-            1 - 2 * (x * x + z * z),
-            2 * (y * z - w * x),
-            2 * (x * z - w * y),
-            2 * (y * z + w * x),
-            1 - 2 * (x * x + y * y),
-        },
-        -1);
-    at::DimVector shape(quats.sizes().slice(0, quats.dim() - 1));
-    shape.push_back(3);
-    shape.push_back(3);
-    return R.reshape(shape);
-}
-
-at::Tensor quat_scale_to_covar_reference(
-    const at::Tensor& quats,
-    const at::Tensor& scales
-) {
-    at::Tensor R = quat_to_rotmat_reference(quats);
-    at::Tensor M = R * scales.unsqueeze(-2);
-    return at::einsum("...ij,...kj->...ik", {M, M});
-}
-
-std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, c10::optional<at::Tensor>>
-projection_ewa_3dgs_fused_reference_forward(
-    const at::Tensor& means,
-    const at::Tensor& covars_full,
-    const at::Tensor& viewmats,
-    const at::Tensor& Ks,
-    int64_t image_width,
-    int64_t image_height,
-    double eps2d,
-    int64_t camera_model,
-    bool calc_compensations
-) {
-    at::Tensor R = viewmats.index({Ellipsis, Slice(None, 3), Slice(None, 3)});
-    at::Tensor t = viewmats.index({Ellipsis, Slice(None, 3), 3});
-    at::Tensor means_c = at::einsum("...cij,...nj->...cni", {R, means}) + t.unsqueeze(-2);
-    at::Tensor covars_c = at::einsum("...cij,...njk,...clk->...cnil", {R, covars_full, R});
-
-    at::Tensor fx = Ks.index({Ellipsis, 0, 0}).unsqueeze(-1);
-    at::Tensor fy = Ks.index({Ellipsis, 1, 1}).unsqueeze(-1);
-    at::Tensor cx = Ks.index({Ellipsis, 0, 2}).unsqueeze(-1);
-    at::Tensor cy = Ks.index({Ellipsis, 1, 2}).unsqueeze(-1);
-
-    at::Tensor means2d;
-    at::Tensor covars2d;
-    if (camera_model == kCameraModelOrtho) {
-        at::Tensor zeros = at::zeros_like(fx);
-        at::DimVector Jshape(fx.sizes());
-        Jshape.push_back(2);
-        Jshape.push_back(3);
-        at::Tensor J = at::stack({fx, zeros, zeros, zeros, fy, zeros}, -1).reshape(Jshape);
-        std::vector<int64_t> repeats(J.dim(), 1);
-        repeats[J.dim() - 3] = means.size(-2);
-        J = J.repeat(repeats);
-        covars2d = at::einsum("...ij,...jk,...kl->...il", {J, covars_c, J.transpose(-1, -2)});
-
-        at::Tensor scales2d =
-            at::stack({Ks.index({Ellipsis, 0, 0}), Ks.index({Ellipsis, 1, 1})}, -1).unsqueeze(-2);
-        at::Tensor offsets2d =
-            at::stack({Ks.index({Ellipsis, 0, 2}), Ks.index({Ellipsis, 1, 2})}, -1).unsqueeze(-2);
-        means2d = means_c.index({Ellipsis, Slice(None, 2)}) * scales2d + offsets2d;
-    } else if (camera_model == kCameraModelFisheye) {
-        at::Tensor x = means_c.index({Ellipsis, 0});
-        at::Tensor y = means_c.index({Ellipsis, 1});
-        at::Tensor z = means_c.index({Ellipsis, 2});
-        at::Tensor eps = at::full({}, 1e-7, means.options());
-        at::Tensor xy_len = at::sqrt(x * x + y * y) + eps;
-        at::Tensor theta = at::atan2(xy_len, z + eps);
-        means2d = at::stack(
-            {
-                x * fx * theta / xy_len + cx,
-                y * fy * theta / xy_len + cy,
-            },
-            -1);
-
-        at::Tensor x2 = x * x + eps;
-        at::Tensor y2 = y * y;
-        at::Tensor xy = x * y;
-        at::Tensor x2y2 = x2 + y2;
-        at::Tensor x2y2z2_inv = 1.0 / (x2y2 + z * z);
-        at::Tensor b = at::atan2(xy_len, z) / xy_len / x2y2;
-        at::Tensor a = z * x2y2z2_inv / x2y2;
-        at::DimVector Jshape(means_c.sizes().slice(0, means_c.dim() - 1));
-        Jshape.push_back(2);
-        Jshape.push_back(3);
-        at::Tensor J = at::stack(
-                           {
-                               fx * (x2 * a + y2 * b),
-                               fx * xy * (a - b),
-                               -fx * x * x2y2z2_inv,
-                               fy * xy * (a - b),
-                               fy * (y2 * a + x2 * b),
-                               -fy * y * x2y2z2_inv,
-                           },
-                           -1)
-                           .reshape(Jshape);
-        covars2d = at::einsum("...ij,...jk,...kl->...il", {J, covars_c, J.transpose(-1, -2)});
-    } else {
-        at::Tensor tx = means_c.index({Ellipsis, 0});
-        at::Tensor ty = means_c.index({Ellipsis, 1});
-        at::Tensor tz = means_c.index({Ellipsis, 2});
-        at::Tensor tz2 = tz * tz;
-        at::Tensor tan_fovx = 0.5 * static_cast<double>(image_width) / fx;
-        at::Tensor tan_fovy = 0.5 * static_cast<double>(image_height) / fy;
-        at::Tensor lim_x_pos = (static_cast<double>(image_width) - cx) / fx + 0.3 * tan_fovx;
-        at::Tensor lim_x_neg = cx / fx + 0.3 * tan_fovx;
-        at::Tensor lim_y_pos = (static_cast<double>(image_height) - cy) / fy + 0.3 * tan_fovy;
-        at::Tensor lim_y_neg = cy / fy + 0.3 * tan_fovy;
-        tx = tz * at::clamp(tx / tz, -lim_x_neg, lim_x_pos);
-        ty = tz * at::clamp(ty / tz, -lim_y_neg, lim_y_pos);
-
-        at::Tensor zeros = at::zeros_like(tx);
-        at::DimVector Jshape(means_c.sizes().slice(0, means_c.dim() - 1));
-        Jshape.push_back(2);
-        Jshape.push_back(3);
-        at::Tensor J = at::stack(
-                           {fx / tz, zeros, -fx * tx / tz2, zeros, fy / tz, -fy * ty / tz2},
-                           -1)
-                           .reshape(Jshape);
-        covars2d = at::einsum("...ij,...jk,...kl->...il", {J, covars_c, J.transpose(-1, -2)});
-        means2d = at::einsum(
-                      "...ij,...nj->...ni",
-                      {Ks.index({Ellipsis, Slice(None, 2), Slice(None, 3)}), means_c}) /
-            tz.unsqueeze(-1);
-    }
-
-    at::Tensor det_orig =
-        covars2d.index({Ellipsis, 0, 0}) * covars2d.index({Ellipsis, 1, 1}) -
-        covars2d.index({Ellipsis, 0, 1}) * covars2d.index({Ellipsis, 1, 0});
-    at::Tensor covars2d_blur =
-        covars2d + at::eye(2, means.options()) * eps2d;
-    at::Tensor det_blur =
-        covars2d_blur.index({Ellipsis, 0, 0}) * covars2d_blur.index({Ellipsis, 1, 1}) -
-        covars2d_blur.index({Ellipsis, 0, 1}) * covars2d_blur.index({Ellipsis, 1, 0});
-    at::Tensor safe_det_blur = det_blur.clamp_min(1e-10);
-
-    c10::optional<at::Tensor> compensations = c10::nullopt;
-    if (calc_compensations) {
-        compensations = at::sqrt(
-            (det_orig / safe_det_blur).clamp_min(kMinCompensation * kMinCompensation));
-    }
-
-    at::Tensor conics = at::stack(
-        {
-            covars2d_blur.index({Ellipsis, 1, 1}) / safe_det_blur,
-            -(covars2d_blur.index({Ellipsis, 0, 1}) + covars2d_blur.index({Ellipsis, 1, 0})) /
-                2.0 / safe_det_blur,
-            covars2d_blur.index({Ellipsis, 0, 0}) / safe_det_blur,
-        },
-        -1);
-    at::Tensor depths = means_c.index({Ellipsis, 2});
-    at::Tensor radius_x =
-        at::ceil(kGaussianExtend * at::sqrt(covars2d_blur.index({Ellipsis, 0, 0}).clamp_min(0.0)));
-    at::Tensor radius_y =
-        at::ceil(kGaussianExtend * at::sqrt(covars2d_blur.index({Ellipsis, 1, 1}).clamp_min(0.0)));
-    at::Tensor radius = at::stack({radius_x, radius_y}, -1);
-    at::Tensor radii = radius.to(at::kInt);
-    return std::make_tuple(radii, means2d, depths, conics, compensations);
 }
 
 }  // namespace
