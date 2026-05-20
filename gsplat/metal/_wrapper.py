@@ -663,6 +663,123 @@ class _FullyFusedProjection(torch.autograd.Function):
         )
 
 
+class _FullyFusedProjection2DGS(torch.autograd.Function):
+    """Autograd bridge for the Metal fused 2DGS projection op.
+
+    Forward runs through the native Metal kernel. Backward currently uses a
+    reference recompute against the PyTorch 2DGS implementation to preserve
+    parity while the native 2DGS VJP is still being hardened.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        means,
+        quats,
+        scales,
+        viewmats,
+        Ks,
+        width,
+        height,
+        eps2d,
+        near_plane,
+        far_plane,
+        radius_clip,
+    ):
+        del eps2d  # CUDA keeps this in the Python signature, but the native fused op does not use it.
+        radii, means2d, depths, ray_transforms, normals = _make_lazy_metal_func(
+            "metal_projection_2dgs_fused_fwd"
+        )(
+            means,
+            quats,
+            scales,
+            viewmats,
+            Ks,
+            width,
+            height,
+            near_plane,
+            far_plane,
+            radius_clip,
+        )
+        ctx.save_for_backward(means, quats, scales, viewmats, Ks, radii, ray_transforms)
+        ctx.width = width
+        ctx.height = height
+        return radii, means2d, depths, ray_transforms, normals
+
+    @staticmethod
+    def backward(ctx, v_radii, v_means2d, v_depths, v_ray_transforms, v_normals):
+        means, quats, scales, viewmats, Ks, radii, ray_transforms = ctx.saved_tensors
+        del v_radii, radii, ray_transforms
+        from gsplat.cuda._torch_impl_2dgs import _fully_fused_projection_2dgs
+
+        with torch.enable_grad():
+            # Stage C keeps a correctness-first backward bridge here so the
+            # public Metal wrapper matches the reference gradient contract even
+            # though the native 2DGS backward kernel is not yet the active path.
+            means_ref = means.detach().clone().requires_grad_(ctx.needs_input_grad[0])
+            quats_ref = quats.detach().clone().requires_grad_(ctx.needs_input_grad[1])
+            scales_ref = scales.detach().clone().requires_grad_(ctx.needs_input_grad[2])
+            viewmats_ref = viewmats.detach().clone().requires_grad_(ctx.needs_input_grad[3])
+            _, means2d_ref, depths_ref, ray_transforms_ref, normals_ref = (
+                _fully_fused_projection_2dgs(
+                    means_ref,
+                    quats_ref,
+                    scales_ref,
+                    viewmats_ref,
+                    Ks.detach(),
+                    ctx.width,
+                    ctx.height,
+                )
+            )
+            loss = (
+                (means2d_ref * v_means2d).sum()
+                + (depths_ref * v_depths).sum()
+                + (ray_transforms_ref * v_ray_transforms).sum()
+                + (normals_ref * v_normals).sum()
+            )
+            grad_inputs = []
+            grad_targets = []
+            if ctx.needs_input_grad[0]:
+                grad_targets.append(means_ref)
+                grad_inputs.append("means")
+            if ctx.needs_input_grad[1]:
+                grad_targets.append(quats_ref)
+                grad_inputs.append("quats")
+            if ctx.needs_input_grad[2]:
+                grad_targets.append(scales_ref)
+                grad_inputs.append("scales")
+            if ctx.needs_input_grad[3]:
+                grad_targets.append(viewmats_ref)
+                grad_inputs.append("viewmats")
+            grad_values = torch.autograd.grad(loss, grad_targets, allow_unused=False)
+            grads = dict(zip(grad_inputs, grad_values))
+        v_means = grads.get("means")
+        v_quats = grads.get("quats")
+        v_scales = grads.get("scales")
+        v_viewmats = grads.get("viewmats")
+        if not ctx.needs_input_grad[0]:
+            v_means = None
+        if not ctx.needs_input_grad[1]:
+            v_quats = None
+        if not ctx.needs_input_grad[2]:
+            v_scales = None
+        if not ctx.needs_input_grad[3]:
+            v_viewmats = None
+        return (
+            v_means,
+            v_quats,
+            v_scales,
+            v_viewmats,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+
+
 class _FullyFusedProjectionPacked(torch.autograd.Function):
     """Autograd bridge for packed Metal 3DGS projection."""
 
@@ -1091,6 +1208,73 @@ def fully_fused_projection(
         calc_compensations,
         camera_model,
         opacities,
+    )
+
+
+def fully_fused_projection_2dgs(
+    means: torch.Tensor,
+    quats: torch.Tensor,
+    scales: torch.Tensor,
+    viewmats: torch.Tensor,
+    Ks: torch.Tensor,
+    width: int,
+    height: int,
+    eps2d: float = 0.3,
+    near_plane: float = 0.01,
+    far_plane: float = 1e10,
+    radius_clip: float = 0.0,
+    packed: bool = False,
+    sparse_grad: bool = False,
+):
+    """Project world-space 2DGS Gaussians to screen-space on MPS."""
+
+    if packed:
+        raise NotImplementedError(
+            "Metal fully_fused_projection_2dgs packed=True is not implemented yet."
+        )
+    if sparse_grad:
+        raise ValueError("sparse_grad is only supported when packed=True")
+    if means.device.type != "mps":
+        raise ValueError(f"means must be on MPS, got {means.device}")
+    if means.dtype != torch.float32:
+        raise ValueError(f"means must be float32, got {means.dtype}")
+    if quats.device != means.device or scales.device != means.device:
+        raise ValueError("quats and scales must be on the same device as means")
+    if viewmats.device != means.device or Ks.device != means.device:
+        raise ValueError("viewmats and Ks must be on the same device as means")
+    if quats.dtype != torch.float32 or scales.dtype != torch.float32:
+        raise ValueError("quats and scales must be float32")
+    if viewmats.dtype != torch.float32 or Ks.dtype != torch.float32:
+        raise ValueError("viewmats and Ks must be float32")
+
+    batch_dims = means.shape[:-2]
+    N = means.shape[-2]
+    C = viewmats.shape[-3]
+    if means.shape != batch_dims + (N, 3):
+        raise ValueError(f"means must have shape [..., N, 3], got {means.shape}")
+    if quats.shape != batch_dims + (N, 4):
+        raise ValueError(f"quats must have shape {batch_dims + (N, 4)}, got {quats.shape}")
+    if scales.shape != batch_dims + (N, 3):
+        raise ValueError(f"scales must have shape {batch_dims + (N, 3)}, got {scales.shape}")
+    if viewmats.shape != batch_dims + (C, 4, 4):
+        raise ValueError(
+            f"viewmats must have shape {batch_dims + (C, 4, 4)}, got {viewmats.shape}"
+        )
+    if Ks.shape != batch_dims + (C, 3, 3):
+        raise ValueError(f"Ks must have shape {batch_dims + (C, 3, 3)}, got {Ks.shape}")
+
+    return _FullyFusedProjection2DGS.apply(
+        means.contiguous(),
+        quats.contiguous(),
+        scales.contiguous(),
+        viewmats.contiguous(),
+        Ks.contiguous(),
+        width,
+        height,
+        eps2d,
+        near_plane,
+        far_plane,
+        radius_clip,
     )
 
 

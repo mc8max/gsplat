@@ -13,9 +13,11 @@ from gsplat.cuda._torch_impl import (
     _persp_proj,
     _spherical_harmonics,
 )
+from gsplat.cuda._torch_impl_2dgs import _fully_fused_projection_2dgs
 
 __all__ = [
     "_fully_fused_projection",
+    "_fully_fused_projection_2dgs",
     "_fisheye_proj",
     "_isect_tiles",
     "_isect_offset_encode",
