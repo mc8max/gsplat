@@ -10,6 +10,9 @@ constant float kMaxAlpha = 0.99f;
 constant float kTransmittanceThreshold = 1.0e-4f;
 constant float kMinOneMinusAlpha = 1.0e-6f;
 constant uint kMaxBlockSize = 256u;
+// Cache small, common channel buckets in threadgroup memory to avoid
+// repeatedly fetching per-Gaussian colors for every pixel in the tile.
+constant uint kCachedChannels = 17u;
 
 // Parallel tree reduction over a threadgroup.
 // Reduces block_size values in log2(block_size) barrier steps instead of
@@ -103,6 +106,7 @@ kernel void rasterize_to_pixels_3dgs_fwd_kernel(
     threadgroup int id_batch[kMaxBlockSize];
     threadgroup float3 xy_opacity_batch[kMaxBlockSize];
     threadgroup float3 conic_batch[kMaxBlockSize];
+    threadgroup float color_batch[kMaxBlockSize * kCachedChannels];
 
     float T = 1.0f;
     int cur_idx = 0;
@@ -126,6 +130,13 @@ kernel void rasterize_to_pixels_3dgs_fwd_kernel(
                 conics[3 * g + 1],
                 conics[3 * g + 2]
             );
+            if (channels <= kCachedChannels) {
+                const uint g_color_base = uint(g) * channels;
+                const uint color_offset = local_idx * kCachedChannels;
+                for (uint k = 0; k < channels; ++k) {
+                    color_batch[color_offset + k] = colors[g_color_base + k];
+                }
+            }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -150,9 +161,13 @@ kernel void rasterize_to_pixels_3dgs_fwd_kernel(
 
             const int g = id_batch[t];
             const float vis = alpha * T;
+            const uint color_offset = t * kCachedChannels;
             const uint g_color_base = uint(g) * channels;
             for (uint k = 0; k < channels; ++k) {
-                render_colors[color_base + k] += colors[g_color_base + k] * vis;
+                const float color = channels <= kCachedChannels
+                    ? color_batch[color_offset + k]
+                    : colors[g_color_base + k];
+                render_colors[color_base + k] += color * vis;
             }
             cur_idx = batch_start + int(t);
             T = next_T;
@@ -241,6 +256,7 @@ kernel void rasterize_to_pixels_3dgs_bwd_kernel(
     threadgroup int id_batch[kMaxBlockSize];
     threadgroup float3 xy_opacity_batch[kMaxBlockSize];
     threadgroup float3 conic_batch[kMaxBlockSize];
+    threadgroup float color_batch[kMaxBlockSize * kCachedChannels];
     threadgroup float reduce_scratch[kMaxBlockSize];
 
     const float px = float(j) + 0.5f;
@@ -278,6 +294,13 @@ kernel void rasterize_to_pixels_3dgs_bwd_kernel(
                 conics[3 * g + 1],
                 conics[3 * g + 2]
             );
+            if (channels <= kCachedChannels) {
+                const uint g_color_base = uint(g) * channels;
+                const uint color_offset = local_idx * kCachedChannels;
+                for (uint k = 0; k < channels; ++k) {
+                    color_batch[color_offset + k] = colors[g_color_base + k];
+                }
+            }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -321,13 +344,17 @@ kernel void rasterize_to_pixels_3dgs_bwd_kernel(
             if (valid) {
                 const uint grad_base = pixel_flat * channels;
                 const int g = id_batch[t];
+                const uint color_offset = t * kCachedChannels;
                 const uint color_base = uint(g) * channels;
                 const float ra = 1.0f / max(kMinOneMinusAlpha, 1.0f - alpha);
                 T *= ra;
                 const float fac = alpha * T;
 
                 for (uint k = 0; k < channels; ++k) {
-                    dot_gc += colors[color_base + k] * v_render_colors[grad_base + k];
+                    const float color = channels <= kCachedChannels
+                        ? color_batch[color_offset + k]
+                        : colors[color_base + k];
+                    dot_gc += color * v_render_colors[grad_base + k];
                 }
 
                 float v_alpha = dot_gc * T - buffer_dot * ra;
@@ -391,8 +418,6 @@ kernel void rasterize_to_pixels_3dgs_bwd_kernel(
             }
 
             const uint grad_base = pixel_flat * channels;
-            const int g = id_batch[t];
-            const uint color_base = uint(g) * channels;
             for (uint k = 0; k < channels; ++k) {
                 float v_rgb = 0.0f;
                 if (valid) {

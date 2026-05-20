@@ -7,7 +7,12 @@ import pytest
 import torch
 
 import gsplat.metal as gm
-from gsplat.metal._math import _isect_offset_encode, _isect_tiles
+from gsplat.metal._math import (
+    _fully_fused_projection,
+    _isect_offset_encode,
+    _isect_tiles,
+    _quat_scale_to_covar_preci,
+)
 
 pytestmark = pytest.mark.skipif(
     not torch.backends.mps.is_available(), reason="MPS required"
@@ -218,6 +223,84 @@ def _sample_inputs(image_count=2, n=10, channels=7, width=32, height=24):
     opacities = torch.rand(image_count, n, dtype=torch.float32) * 0.7 + 0.2
     backgrounds = torch.rand(image_count, channels, dtype=torch.float32)
     return means2d, radii, depths, conics, colors, opacities, backgrounds
+
+
+def _sample_world_inputs(c=2, n=8, channels=5, width=32, height=24):
+    torch.manual_seed(7)
+    means = torch.randn(n, 3, dtype=torch.float32) * 0.2
+    means[:, 2] = torch.rand(n, dtype=torch.float32) * 1.5 + 1.5
+    quats = torch.randn(n, 4, dtype=torch.float32)
+    scales = torch.rand(n, 3, dtype=torch.float32) * 0.2 + 0.15
+    viewmats = torch.eye(4, dtype=torch.float32).expand(c, 4, 4).clone()
+    viewmats[:, 0, 3] = torch.linspace(-0.05, 0.05, c, dtype=torch.float32)
+    viewmats[:, 1, 3] = torch.linspace(0.04, -0.04, c, dtype=torch.float32)
+    Ks = torch.zeros(c, 3, 3, dtype=torch.float32)
+    Ks[:, 0, 0] = 220.0
+    Ks[:, 1, 1] = 210.0
+    Ks[:, 0, 2] = width * 0.5
+    Ks[:, 1, 2] = height * 0.5
+    Ks[:, 2, 2] = 1.0
+    colors = torch.rand(c, n, channels, dtype=torch.float32)
+    opacities = torch.rand(n, dtype=torch.float32) * 0.6 + 0.3
+    backgrounds = torch.rand(c, channels, dtype=torch.float32)
+    return means, quats, scales, viewmats, Ks, colors, opacities, backgrounds
+
+
+def _absgrad_reference(
+    means2d,
+    conics,
+    colors,
+    opacities,
+    image_width,
+    image_height,
+    tile_size,
+    isect_offsets,
+    flatten_ids,
+    v_render_colors,
+    v_render_alphas,
+    backgrounds=None,
+    masks=None,
+):
+    means2d_ref = means2d.clone().requires_grad_(True)
+    conics_ref = conics.clone().requires_grad_(True)
+    colors_ref = colors.clone().requires_grad_(True)
+    opacities_ref = opacities.clone().requires_grad_(True)
+    backgrounds_ref = backgrounds.clone().requires_grad_(True) if backgrounds is not None else None
+    render_colors, render_alphas = _rasterize_reference_autograd(
+        means2d_ref,
+        conics_ref,
+        colors_ref,
+        opacities_ref,
+        image_width,
+        image_height,
+        tile_size,
+        isect_offsets,
+        flatten_ids,
+        backgrounds=backgrounds_ref,
+        masks=masks,
+    )
+
+    absgrad = torch.zeros_like(means2d_ref)
+    image_dims = render_alphas.shape[:-3]
+    shape = (*image_dims, image_height, image_width)
+    for flat_idx in range(math.prod(shape)):
+        unravel = []
+        rem = flat_idx
+        for size in reversed(shape):
+            unravel.append(rem % size)
+            rem //= size
+        index_tuple = tuple(reversed(unravel))
+        color_scalar = (render_colors[index_tuple] * v_render_colors[index_tuple]).sum()
+        alpha_scalar = (
+            render_alphas[index_tuple + (0,)] * v_render_alphas[index_tuple + (0,)]
+        ).sum()
+        pixel_grad = torch.autograd.grad(
+            color_scalar + alpha_scalar,
+            means2d_ref,
+            retain_graph=True,
+        )[0]
+        absgrad = absgrad + pixel_grad.abs()
+    return absgrad
 
 
 def test_unpacked_forward_matches_reference(mps_device):
@@ -521,3 +604,156 @@ def test_backward_matches_reference_packed(mps_device):
         (grads[4], ref_grads[4], 2e-4, 2e-4),
     ):
         torch.testing.assert_close(actual.cpu(), expected, atol=atol, rtol=rtol)
+
+
+def test_absgrad_matches_reference(mps_device):
+    width, height = 12, 8
+    tile_size = 4
+    tile_width = math.ceil(width / tile_size)
+    tile_height = math.ceil(height / tile_size)
+    means2d, radii, depths, conics, colors, opacities, backgrounds = _sample_inputs(
+        image_count=1, n=4, channels=3, width=width, height=height
+    )
+    _, isect_ids, flatten_ids = _isect_tiles(means2d, radii, depths, tile_size, tile_width, tile_height)
+    isect_offsets = _isect_offset_encode(isect_ids, means2d.shape[0], tile_width, tile_height)
+
+    v_render_colors = torch.randn(1, height, width, 3, dtype=torch.float32)
+    v_render_alphas = torch.randn(1, height, width, 1, dtype=torch.float32)
+    expected_absgrad = _absgrad_reference(
+        means2d,
+        conics,
+        colors,
+        opacities,
+        width,
+        height,
+        tile_size,
+        isect_offsets,
+        flatten_ids,
+        v_render_colors,
+        v_render_alphas,
+        backgrounds=backgrounds,
+    )
+
+    means2d_mps = means2d.clone().to(mps_device).requires_grad_(True)
+    conics_mps = conics.clone().to(mps_device).requires_grad_(True)
+    colors_mps = colors.clone().to(mps_device).requires_grad_(True)
+    opacities_mps = opacities.clone().to(mps_device).requires_grad_(True)
+    backgrounds_mps = backgrounds.clone().to(mps_device).requires_grad_(True)
+    out_colors, out_alphas = gm.rasterize_to_pixels(
+        means2d_mps,
+        conics_mps,
+        colors_mps,
+        opacities_mps,
+        width,
+        height,
+        tile_size,
+        isect_offsets.to(mps_device),
+        flatten_ids.to(mps_device),
+        backgrounds=backgrounds_mps,
+        absgrad=True,
+    )
+    loss = (
+        (out_colors * v_render_colors.to(mps_device)).sum()
+        + (out_alphas * v_render_alphas.to(mps_device)).sum()
+    )
+    loss.backward()
+    assert hasattr(means2d_mps, "absgrad")
+    torch.testing.assert_close(
+        means2d_mps.absgrad.cpu(),
+        expected_absgrad,
+        atol=2e-4,
+        rtol=2e-4,
+    )
+
+
+def test_end_to_end_pipeline_matches_reference(mps_device):
+    width, height = 32, 24
+    tile_size = 4
+    tile_width = math.ceil(width / tile_size)
+    tile_height = math.ceil(height / tile_size)
+    means, quats, scales, viewmats, Ks, colors, opacities, backgrounds = _sample_world_inputs(
+        c=2, n=8, channels=5, width=width, height=height
+    )
+
+    covars_full, _ = _quat_scale_to_covar_preci(
+        quats, scales, compute_covar=True, compute_preci=False, triu=False
+    )
+    expected_radii, expected_means2d, expected_depths, expected_conics, _ = _fully_fused_projection(
+        means,
+        covars_full,
+        viewmats,
+        Ks,
+        width,
+        height,
+        calc_compensations=False,
+        camera_model="pinhole",
+    )
+    expected_opacities = torch.broadcast_to(opacities[None, :], expected_depths.shape)
+    _, expected_isect_ids, expected_flatten_ids = _isect_tiles(
+        expected_means2d,
+        expected_radii,
+        expected_depths,
+        tile_size,
+        tile_width,
+        tile_height,
+    )
+    expected_offsets = _isect_offset_encode(
+        expected_isect_ids,
+        viewmats.shape[0],
+        tile_width,
+        tile_height,
+    )
+    expected_colors, expected_alphas, _ = _rasterize_reference(
+        expected_means2d,
+        expected_conics,
+        colors,
+        expected_opacities,
+        width,
+        height,
+        tile_size,
+        expected_offsets,
+        expected_flatten_ids,
+        backgrounds=backgrounds,
+    )
+
+    actual_radii, actual_means2d, actual_depths, actual_conics, _ = gm.fully_fused_projection(
+        means.to(mps_device),
+        None,
+        quats.to(mps_device),
+        scales.to(mps_device),
+        viewmats.to(mps_device),
+        Ks.to(mps_device),
+        width,
+        height,
+        calc_compensations=False,
+        camera_model="pinhole",
+    )
+    actual_opacities = torch.broadcast_to(opacities.to(mps_device)[None, :], actual_depths.shape)
+    _, actual_isect_ids, actual_flatten_ids = gm.intersect_tiles(
+        actual_means2d,
+        actual_radii,
+        actual_depths,
+        tile_size,
+        tile_width,
+        tile_height,
+    )
+    actual_offsets = gm.intersect_offset_encode(
+        actual_isect_ids,
+        viewmats.shape[0],
+        tile_width,
+        tile_height,
+    )
+    actual_colors, actual_alphas = gm.rasterize_to_pixels(
+        actual_means2d,
+        actual_conics,
+        colors.to(mps_device),
+        actual_opacities,
+        width,
+        height,
+        tile_size,
+        actual_offsets,
+        actual_flatten_ids,
+        backgrounds=backgrounds.to(mps_device),
+    )
+    torch.testing.assert_close(actual_colors.cpu(), expected_colors, atol=2e-4, rtol=2e-4)
+    torch.testing.assert_close(actual_alphas.cpu(), expected_alphas, atol=2e-4, rtol=2e-4)
