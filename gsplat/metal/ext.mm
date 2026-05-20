@@ -8,6 +8,7 @@
 #include "ops/intersect_offset.h"
 #include "ops/intersect_tile.h"
 #include "ops/null.h"
+#include "ops/projection_ewa_3dgs_packed.h"
 #include "ops/projection_ewa_3dgs_fused.h"
 #include "ops/projection_ewa_simple.h"
 #include "ops/quat_scale_to_covar_preci.h"
@@ -57,6 +58,21 @@ TORCH_LIBRARY_FRAGMENT(gsplat, m) {
         "Tensor rays, Tensor h_poly, Tensor v_poly, Tensor h_inv_poly, "
         "Tensor v_inv_poly, int reference_poly, bool inverse"
         ") -> Tensor");
+    m.def(
+        "metal_projection_ewa_3dgs_packed_fwd("
+        "Tensor means, Tensor? covars, Tensor? quats, Tensor? scales, Tensor? opacities, "
+        "Tensor viewmats, Tensor Ks, int image_width, int image_height, float eps2d, "
+        "float near_plane, float far_plane, float radius_clip, bool calc_compensations, "
+        "int camera_model"
+        ") -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor?)");
+    m.def(
+        "metal_projection_ewa_3dgs_packed_bwd("
+        "Tensor means, Tensor? covars, Tensor? quats, Tensor? scales, Tensor viewmats, "
+        "Tensor Ks, int image_width, int image_height, float eps2d, int camera_model, "
+        "Tensor batch_ids, Tensor camera_ids, Tensor gaussian_ids, Tensor conics, "
+        "Tensor? compensations, Tensor v_means2d, Tensor v_depths, Tensor v_conics, "
+        "Tensor? v_compensations, bool viewmats_requires_grad, bool sparse_grad"
+        ") -> (Tensor, Tensor, Tensor, Tensor, Tensor)");
     m.def(
         "metal_projection_ewa_3dgs_fused_fwd("
         "Tensor means, Tensor? covars, Tensor? quats, Tensor? scales, Tensor? opacities, "
@@ -124,6 +140,8 @@ TORCH_LIBRARY_IMPL(gsplat, MPS, m) {
     m.impl("metal_intersect_tile_count", &intersect_tile_count_op);
     m.impl("metal_intersect_tile_emit", &intersect_tile_emit_op);
     m.impl("metal_intersect_tile", &intersect_tile_op);
+    m.impl("metal_projection_ewa_3dgs_packed_fwd", &projection_ewa_3dgs_packed_fwd_op);
+    m.impl("metal_projection_ewa_3dgs_packed_bwd", &projection_ewa_3dgs_packed_bwd_op);
     m.impl("metal_projection_ewa_3dgs_fused_fwd", &projection_ewa_3dgs_fused_fwd_op);
     m.impl("metal_projection_ewa_3dgs_fused_bwd", &projection_ewa_3dgs_fused_bwd_op);
     m.impl("metal_projection_ewa_simple_fwd", &projection_ewa_simple_fwd_op);

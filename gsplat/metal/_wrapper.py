@@ -395,6 +395,16 @@ _CAMERA_MODEL_TO_INT = {
 }
 
 
+def _sparse_coo_grad(indices: torch.Tensor, values: torch.Tensor, size, *, is_coalesced: bool):
+    return torch.sparse_coo_tensor(
+        indices=indices,
+        values=values,
+        size=size,
+        is_coalesced=is_coalesced,
+        check_invariants=False,
+    )
+
+
 class _QuatScaleToCovarPreci(torch.autograd.Function):
     """Autograd bridge for the Metal quat-scale-to-covariance/precision op."""
     
@@ -653,6 +663,209 @@ class _FullyFusedProjection(torch.autograd.Function):
         )
 
 
+class _FullyFusedProjectionPacked(torch.autograd.Function):
+    """Autograd bridge for packed Metal 3DGS projection."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        means,
+        covars,
+        quats,
+        scales,
+        viewmats,
+        Ks,
+        width,
+        height,
+        eps2d,
+        near_plane,
+        far_plane,
+        radius_clip,
+        sparse_grad,
+        calc_compensations,
+        camera_model,
+        opacities=None,
+    ):
+        ctx.set_materialize_grads(False)
+        (
+            indptr,
+            batch_ids,
+            camera_ids,
+            gaussian_ids,
+            radii,
+            means2d,
+            depths,
+            conics,
+            compensations,
+        ) = _make_lazy_metal_func("metal_projection_ewa_3dgs_packed_fwd")(
+            means,
+            covars,
+            quats,
+            scales,
+            opacities,
+            viewmats,
+            Ks,
+            width,
+            height,
+            eps2d,
+            near_plane,
+            far_plane,
+            radius_clip,
+            calc_compensations,
+            _CAMERA_MODEL_TO_INT[camera_model],
+        )
+        if not calc_compensations:
+            compensations = None
+        ctx.save_for_backward(
+            batch_ids,
+            camera_ids,
+            gaussian_ids,
+            means,
+            covars if covars is not None else torch.empty(0, device=means.device, dtype=means.dtype),
+            quats if quats is not None else torch.empty(0, device=means.device, dtype=means.dtype),
+            scales if scales is not None else torch.empty(0, device=means.device, dtype=means.dtype),
+            viewmats,
+            Ks,
+            conics,
+            compensations if compensations is not None else torch.empty(0, device=means.device, dtype=means.dtype),
+        )
+        ctx.width = width
+        ctx.height = height
+        ctx.eps2d = eps2d
+        ctx.sparse_grad = sparse_grad
+        ctx.camera_model = camera_model
+        ctx.has_covars = covars is not None
+        ctx.has_quats = quats is not None
+        ctx.has_scales = scales is not None
+        ctx.has_compensations = compensations is not None
+        return (
+            batch_ids,
+            camera_ids,
+            gaussian_ids,
+            indptr,
+            radii,
+            means2d,
+            depths,
+            conics,
+            compensations,
+        )
+
+    @staticmethod
+    def backward(
+        ctx,
+        v_batch_ids,
+        v_camera_ids,
+        v_gaussian_ids,
+        v_indptr,
+        v_radii,
+        v_means2d,
+        v_depths,
+        v_conics,
+        v_compensations,
+    ):
+        (
+            batch_ids,
+            camera_ids,
+            gaussian_ids,
+            means,
+            covars,
+            quats,
+            scales,
+            viewmats,
+            Ks,
+            conics,
+            compensations,
+        ) = ctx.saved_tensors
+        covars = covars if ctx.has_covars else None
+        quats = quats if ctx.has_quats else None
+        scales = scales if ctx.has_scales else None
+        compensations = compensations if ctx.has_compensations else None
+        if v_compensations is not None:
+            v_compensations = v_compensations.contiguous()
+        v_means, v_covars, v_quats, v_scales, v_viewmats = _make_lazy_metal_func(
+            "metal_projection_ewa_3dgs_packed_bwd"
+        )(
+            means,
+            covars,
+            quats,
+            scales,
+            viewmats,
+            Ks,
+            ctx.width,
+            ctx.height,
+            ctx.eps2d,
+            _CAMERA_MODEL_TO_INT[ctx.camera_model],
+            batch_ids,
+            camera_ids,
+            gaussian_ids,
+            conics,
+            compensations,
+            v_means2d.contiguous(),
+            v_depths.contiguous(),
+            v_conics.contiguous(),
+            v_compensations,
+            ctx.needs_input_grad[4],
+            ctx.sparse_grad,
+        )
+
+        if ctx.sparse_grad:
+            if ctx.needs_input_grad[0]:
+                v_means = _sparse_coo_grad(
+                    gaussian_ids[None], v_means, means.shape, is_coalesced=len(viewmats) == 1
+                )
+            else:
+                v_means = None
+            if ctx.needs_input_grad[1]:
+                v_covars = _sparse_coo_grad(
+                    gaussian_ids[None], v_covars, covars.shape, is_coalesced=len(viewmats) == 1
+                )
+            else:
+                v_covars = None
+            if ctx.needs_input_grad[2]:
+                v_quats = _sparse_coo_grad(
+                    gaussian_ids[None], v_quats, quats.shape, is_coalesced=len(viewmats) == 1
+                )
+            else:
+                v_quats = None
+            if ctx.needs_input_grad[3]:
+                v_scales = _sparse_coo_grad(
+                    gaussian_ids[None], v_scales, scales.shape, is_coalesced=len(viewmats) == 1
+                )
+            else:
+                v_scales = None
+        else:
+            if not ctx.needs_input_grad[0]:
+                v_means = None
+            if not ctx.needs_input_grad[1]:
+                v_covars = None
+            if not ctx.needs_input_grad[2]:
+                v_quats = None
+            if not ctx.needs_input_grad[3]:
+                v_scales = None
+
+        if not ctx.needs_input_grad[4]:
+            v_viewmats = None
+
+        return (
+            v_means,
+            v_covars,
+            v_quats,
+            v_scales,
+            v_viewmats,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+
+
 def quat_scale_to_covar_preci(
     quats: torch.Tensor,
     scales: torch.Tensor,
@@ -787,10 +1000,6 @@ def fully_fused_projection(
 ):
     """Project world-space 3DGS Gaussians to screen-space on MPS."""
 
-    if packed:
-        raise NotImplementedError("Metal fully_fused_projection currently supports packed=False only")
-    if sparse_grad:
-        raise NotImplementedError("Metal fully_fused_projection does not support sparse_grad")
     if camera_model == "ftheta":
         raise ValueError(
             "ftheta camera is only supported via UT, please set with_ut=True in the rasterization()"
@@ -843,6 +1052,29 @@ def fully_fused_projection(
         if opacities.shape != batch_dims + (N,):
             raise ValueError(f"opacities must have shape {batch_dims + (N,)}, got {opacities.shape}")
         opacities = opacities.contiguous()
+    if packed:
+        if sparse_grad and batch_dims != ():
+            raise ValueError("sparse_grad does not support batch dimensions when packed=True")
+        return _FullyFusedProjectionPacked.apply(
+            means.contiguous(),
+            covars.contiguous() if covars is not None else None,
+            quats.contiguous() if quats is not None else None,
+            scales.contiguous() if scales is not None else None,
+            viewmats.contiguous(),
+            Ks.contiguous(),
+            width,
+            height,
+            eps2d,
+            near_plane,
+            far_plane,
+            radius_clip,
+            sparse_grad,
+            calc_compensations,
+            camera_model,
+            opacities,
+        )
+    if sparse_grad:
+        raise NotImplementedError("Metal fully_fused_projection does not support sparse_grad")
     return _FullyFusedProjection.apply(
         means.contiguous(),
         covars.contiguous() if covars is not None else None,
