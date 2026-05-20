@@ -860,3 +860,266 @@ def fully_fused_projection(
         camera_model,
         opacities,
     )
+
+
+class _RasterizeToPixels(torch.autograd.Function):
+    """Autograd bridge for the Metal 3DGS rasterization op."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        means2d,
+        conics,
+        colors,
+        opacities,
+        backgrounds,
+        masks,
+        width,
+        height,
+        tile_size,
+        isect_offsets,
+        flatten_ids,
+        absgrad,
+    ):
+        ctx.set_materialize_grads(False)
+        render_colors, render_alphas, last_ids = _make_lazy_metal_func(
+            "metal_rasterize_to_pixels_3dgs_fwd"
+        )(
+            means2d,
+            conics,
+            colors,
+            opacities,
+            backgrounds,
+            masks,
+            width,
+            height,
+            tile_size,
+            isect_offsets,
+            flatten_ids,
+        )
+        ctx.save_for_backward(
+            means2d,
+            conics,
+            colors,
+            opacities,
+            backgrounds
+            if backgrounds is not None
+            else torch.empty(0, device=means2d.device, dtype=means2d.dtype),
+            masks
+            if masks is not None
+            else torch.empty(0, device=means2d.device, dtype=torch.bool),
+            isect_offsets,
+            flatten_ids,
+            render_alphas,
+            last_ids,
+        )
+        ctx.width = width
+        ctx.height = height
+        ctx.tile_size = tile_size
+        ctx.absgrad = absgrad
+        ctx.has_backgrounds = backgrounds is not None
+        ctx.has_masks = masks is not None
+        return render_colors, render_alphas
+
+    @staticmethod
+    def backward(ctx, v_render_colors, v_render_alphas):
+        (
+            means2d,
+            conics,
+            colors,
+            opacities,
+            backgrounds,
+            masks,
+            isect_offsets,
+            flatten_ids,
+            render_alphas,
+            last_ids,
+        ) = ctx.saved_tensors
+        backgrounds = backgrounds if ctx.has_backgrounds else None
+        masks = masks if ctx.has_masks else None
+
+        (
+            v_means2d_abs,
+            v_means2d,
+            v_conics,
+            v_colors,
+            v_opacities,
+        ) = _make_lazy_metal_func("metal_rasterize_to_pixels_3dgs_bwd")(
+            means2d,
+            conics,
+            colors,
+            opacities,
+            backgrounds,
+            masks,
+            ctx.width,
+            ctx.height,
+            ctx.tile_size,
+            isect_offsets,
+            flatten_ids,
+            render_alphas,
+            last_ids,
+            v_render_colors.contiguous(),
+            v_render_alphas.contiguous(),
+            ctx.absgrad,
+        )
+
+        if ctx.absgrad and v_means2d_abs is not None:
+            means2d.absgrad = v_means2d_abs
+
+        if ctx.needs_input_grad[4]:
+            v_backgrounds = (v_render_colors * (1.0 - render_alphas)).sum(dim=(-3, -2))
+        else:
+            v_backgrounds = None
+
+        return (
+            v_means2d,
+            v_conics,
+            v_colors,
+            v_opacities,
+            v_backgrounds,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+
+
+def rasterize_to_pixels(
+    means2d: torch.Tensor,
+    conics: torch.Tensor,
+    colors: torch.Tensor,
+    opacities: torch.Tensor,
+    image_width: int,
+    image_height: int,
+    tile_size: int,
+    isect_offsets: torch.Tensor,
+    flatten_ids: torch.Tensor,
+    backgrounds: Optional[torch.Tensor] = None,
+    masks: Optional[torch.Tensor] = None,
+    packed: bool = False,
+    absgrad: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Rasterize projected 3DGS Gaussians to pixels on MPS."""
+
+    image_dims = isect_offsets.shape[:-2]
+    channels = colors.shape[-1]
+    device = means2d.device
+    if device.type != "mps":
+        raise ValueError(f"means2d must be on MPS, got {device}")
+    if packed:
+        nnz = means2d.size(0)
+        if means2d.shape != (nnz, 2):
+            raise ValueError(f"packed means2d must have shape (nnz, 2), got {means2d.shape}")
+        if conics.shape != (nnz, 3):
+            raise ValueError(f"packed conics must have shape (nnz, 3), got {conics.shape}")
+        if colors.shape[0] != nnz:
+            raise ValueError(f"packed colors must have nnz leading dim, got {colors.shape}")
+        if opacities.shape != (nnz,):
+            raise ValueError(f"packed opacities must have shape (nnz,), got {opacities.shape}")
+    else:
+        means_image_dims = means2d.shape[:-2]
+        N = means2d.size(-2)
+        if means2d.shape != means_image_dims + (N, 2):
+            raise ValueError(f"means2d must have shape {means_image_dims + (N, 2)}, got {means2d.shape}")
+        if means_image_dims != image_dims:
+            raise ValueError(
+                f"means2d image dims must match isect_offsets image dims, got {means_image_dims} vs {image_dims}"
+            )
+        if conics.shape != means_image_dims + (N, 3):
+            raise ValueError(f"conics must have shape {means_image_dims + (N, 3)}, got {conics.shape}")
+        if colors.shape != means_image_dims + (N, channels):
+            raise ValueError(f"colors must have shape {means_image_dims + (N, channels)}, got {colors.shape}")
+        if opacities.shape != means_image_dims + (N,):
+            raise ValueError(f"opacities must have shape {means_image_dims + (N,)}, got {opacities.shape}")
+    if means2d.dtype != torch.float32 or conics.dtype != torch.float32:
+        raise ValueError("means2d and conics must be float32")
+    if colors.dtype != torch.float32 or opacities.dtype != torch.float32:
+        raise ValueError("colors and opacities must be float32")
+    if isect_offsets.device != device or flatten_ids.device != device:
+        raise ValueError("isect_offsets and flatten_ids must be on the same device as means2d")
+    if isect_offsets.dtype != torch.int32:
+        raise ValueError(f"isect_offsets must be int32, got {isect_offsets.dtype}")
+    if flatten_ids.dtype != torch.int32:
+        raise ValueError(f"flatten_ids must be int32, got {flatten_ids.dtype}")
+    if backgrounds is not None:
+        if backgrounds.device != device or backgrounds.dtype != torch.float32:
+            raise ValueError("backgrounds must be float32 on the same device as means2d")
+        if backgrounds.shape != image_dims + (channels,):
+            raise ValueError(f"backgrounds must have shape {image_dims + (channels,)}, got {backgrounds.shape}")
+        backgrounds = backgrounds.contiguous()
+    if masks is not None:
+        if masks.device != device or masks.dtype != torch.bool:
+            raise ValueError("masks must be bool on the same device as means2d")
+        if masks.shape != isect_offsets.shape:
+            raise ValueError(f"masks must have shape {isect_offsets.shape}, got {masks.shape}")
+        masks = masks.contiguous()
+
+    if channels > 513 or channels == 0:
+        raise ValueError(f"Unsupported number of color channels: {channels}")
+    if channels not in (
+        1,
+        2,
+        3,
+        4,
+        5,
+        8,
+        9,
+        16,
+        17,
+        32,
+        33,
+        64,
+        65,
+        128,
+        129,
+        256,
+        257,
+        512,
+        513,
+    ):
+        padded_channels = (1 << (channels - 1).bit_length()) - channels
+        colors = torch.cat(
+            [colors, torch.zeros(*colors.shape[:-1], padded_channels, device=device)],
+            dim=-1,
+        )
+        if backgrounds is not None:
+            backgrounds = torch.cat(
+                [
+                    backgrounds,
+                    torch.zeros(*backgrounds.shape[:-1], padded_channels, device=device),
+                ],
+                dim=-1,
+            )
+    else:
+        padded_channels = 0
+
+    tile_height, tile_width = isect_offsets.shape[-2:]
+    if tile_height * tile_size < image_height:
+        raise ValueError(
+            f"tile_height * tile_size must cover image_height, got {tile_height} * {tile_size} < {image_height}"
+        )
+    if tile_width * tile_size < image_width:
+        raise ValueError(
+            f"tile_width * tile_size must cover image_width, got {tile_width} * {tile_size} < {image_width}"
+        )
+
+    render_colors, render_alphas = _RasterizeToPixels.apply(
+        means2d.contiguous(),
+        conics.contiguous(),
+        colors.contiguous(),
+        opacities.contiguous(),
+        backgrounds,
+        masks,
+        image_width,
+        image_height,
+        tile_size,
+        isect_offsets.contiguous(),
+        flatten_ids.contiguous(),
+        absgrad,
+    )
+    if padded_channels > 0:
+        render_colors = render_colors[..., :-padded_channels]
+    return render_colors, render_alphas

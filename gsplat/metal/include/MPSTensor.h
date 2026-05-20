@@ -5,6 +5,8 @@
 
 #import <Metal/Metal.h>
 
+#include <limits>
+
 #include <torch/extension.h>
 
 namespace gsplat::metal {
@@ -61,6 +63,19 @@ inline void set_optional_tensor_buffer(
 
 inline uint32_t round_up(uint32_t n, uint32_t multiple) {
     return ((n + multiple - 1) / multiple) * multiple;
+}
+
+inline uint32_t product_i64_to_u32(const at::IntArrayRef dims, const char* name) {
+    uint64_t prod = 1;
+    for (const auto dim : dims) {
+        TORCH_CHECK(dim >= 0, name, " dimensions must be non-negative");
+        prod *= static_cast<uint64_t>(dim);
+        TORCH_CHECK(
+            prod <= static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()),
+            name,
+            " flattened size must fit in uint32_t");
+    }
+    return static_cast<uint32_t>(prod);
 }
 
 }  // namespace gsplat::metal

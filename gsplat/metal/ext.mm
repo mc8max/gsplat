@@ -11,6 +11,7 @@
 #include "ops/projection_ewa_3dgs_fused.h"
 #include "ops/projection_ewa_simple.h"
 #include "ops/quat_scale_to_covar_preci.h"
+#include "ops/rasterize_to_pixels_3dgs.h"
 #include "ops/spherical_harmonics.h"
 #include "ops/sort_int64.h"
 
@@ -101,6 +102,19 @@ TORCH_LIBRARY_FRAGMENT(gsplat, m) {
         "Tensor? image_ids, Tensor? gaussian_ids, int I, int tile_size, int tile_width, "
         "int tile_height, bool sort, bool packed, bool segmented"
         ") -> (Tensor, Tensor, Tensor)");
+    m.def(
+        "metal_rasterize_to_pixels_3dgs_fwd("
+        "Tensor means2d, Tensor conics, Tensor colors, Tensor opacities, "
+        "Tensor? backgrounds, Tensor? masks, int image_width, int image_height, "
+        "int tile_size, Tensor tile_offsets, Tensor flatten_ids"
+        ") -> (Tensor, Tensor, Tensor)");
+    m.def(
+        "metal_rasterize_to_pixels_3dgs_bwd("
+        "Tensor means2d, Tensor conics, Tensor colors, Tensor opacities, "
+        "Tensor? backgrounds, Tensor? masks, int image_width, int image_height, "
+        "int tile_size, Tensor tile_offsets, Tensor flatten_ids, Tensor render_alphas, "
+        "Tensor last_ids, Tensor v_render_colors, Tensor v_render_alphas, bool absgrad"
+        ") -> (Tensor?, Tensor, Tensor, Tensor, Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(gsplat, MPS, m) {
@@ -114,6 +128,8 @@ TORCH_LIBRARY_IMPL(gsplat, MPS, m) {
     m.impl("metal_projection_ewa_3dgs_fused_bwd", &projection_ewa_3dgs_fused_bwd_op);
     m.impl("metal_projection_ewa_simple_fwd", &projection_ewa_simple_fwd_op);
     m.impl("metal_projection_ewa_simple_bwd", &projection_ewa_simple_bwd_op);
+    m.impl("metal_rasterize_to_pixels_3dgs_fwd", &rasterize_to_pixels_3dgs_fwd_op);
+    m.impl("metal_rasterize_to_pixels_3dgs_bwd", &rasterize_to_pixels_3dgs_bwd_op);
     m.impl("metal_null", &null_op);
     m.impl(
         "metal_quat_scale_to_covar_preci_fwd",

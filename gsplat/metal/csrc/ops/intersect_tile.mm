@@ -45,19 +45,6 @@ uint32_t tile_n_bits_from_grid(int64_t tile_width, int64_t tile_height) {
     return 32u - static_cast<uint32_t>(__builtin_clz(static_cast<uint32_t>(n_tiles)));
 }
 
-uint32_t product_i64_to_u32(const at::IntArrayRef dims, const char* name) {
-    uint64_t prod = 1;
-    for (const auto dim : dims) {
-        TORCH_CHECK(dim >= 0, name, " dimensions must be non-negative");
-        prod *= static_cast<uint64_t>(dim);
-        TORCH_CHECK(
-            prod <= static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()),
-            name,
-            " flattened size must fit in uint32_t");
-    }
-    return static_cast<uint32_t>(prod);
-}
-
 IntersectTileConfig validate_common(
     const at::Tensor& means2d,
     const at::Tensor& radii,
