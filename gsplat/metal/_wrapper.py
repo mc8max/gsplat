@@ -1278,6 +1278,374 @@ def fully_fused_projection_2dgs(
     )
 
 
+def _rasterize_to_pixels_2dgs_reference_autograd(
+    means2d: torch.Tensor,
+    ray_transforms: torch.Tensor,
+    colors: torch.Tensor,
+    opacities: torch.Tensor,
+    normals: torch.Tensor,
+    image_width: int,
+    image_height: int,
+    tile_size: int,
+    isect_offsets: torch.Tensor,
+    flatten_ids: torch.Tensor,
+    backgrounds: Optional[torch.Tensor] = None,
+    masks: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    image_dims = tuple(isect_offsets.shape[:-2])
+    I = math.prod(image_dims)
+    channels = colors.shape[-1]
+    tile_height, tile_width = isect_offsets.shape[-2:]
+    n_isects = int(flatten_ids.numel())
+    device = means2d.device
+    dtype = means2d.dtype
+
+    render_colors = torch.zeros(*image_dims, image_height, image_width, channels, dtype=dtype, device=device)
+    render_alphas = torch.zeros(*image_dims, image_height, image_width, 1, dtype=dtype, device=device)
+    render_normals = torch.zeros(*image_dims, image_height, image_width, 3, dtype=dtype, device=device)
+    render_distort = torch.zeros(*image_dims, image_height, image_width, 1, dtype=dtype, device=device)
+    if backgrounds is not None:
+        render_colors = render_colors + backgrounds.unsqueeze(-2).unsqueeze(-2)
+
+    offsets_flat = isect_offsets.reshape(I, tile_height * tile_width)
+    means_flat = means2d.reshape(-1, 2)
+    ray_flat = ray_transforms.reshape(-1, 3, 3)
+    colors_flat = colors.reshape(-1, channels)
+    opacities_flat = opacities.reshape(-1)
+    normals_flat = normals.reshape(-1, 3)
+    alpha_threshold = torch.tensor(1.0 / 255.0, dtype=dtype, device=device)
+    max_alpha = torch.tensor(0.99, dtype=dtype, device=device)
+    trans_thresh = 1.0e-4
+    filter_inv_square = torch.tensor(2.0, dtype=dtype, device=device)
+
+    for image_id in range(I):
+        for tile_y in range(tile_height):
+            for tile_x in range(tile_width):
+                tile_id = tile_y * tile_width + tile_x
+                global_tile = image_id * tile_height * tile_width + tile_id
+                range_start = int(offsets_flat[image_id, tile_id].item())
+                if global_tile + 1 < I * tile_height * tile_width:
+                    next_image = (global_tile + 1) // (tile_height * tile_width)
+                    next_tile = (global_tile + 1) % (tile_height * tile_width)
+                    range_end = int(offsets_flat[next_image, next_tile].item())
+                else:
+                    range_end = n_isects
+
+                masked = masks is not None and not bool(
+                    masks.reshape(I, tile_height, tile_width)[image_id, tile_y, tile_x].item()
+                )
+                for local_y in range(tile_size):
+                    for local_x in range(tile_size):
+                        i = tile_y * tile_size + local_y
+                        j = tile_x * tile_size + local_x
+                        if i >= image_height or j >= image_width or masked:
+                            continue
+
+                        px = torch.tensor(float(j) + 0.5, dtype=dtype, device=device)
+                        py = torch.tensor(float(i) + 0.5, dtype=dtype, device=device)
+                        T = torch.tensor(1.0, dtype=dtype, device=device)
+                        accum = torch.zeros(channels, dtype=dtype, device=device)
+                        accum_normal = torch.zeros(3, dtype=dtype, device=device)
+                        distort = torch.tensor(0.0, dtype=dtype, device=device)
+                        accum_vis_depth = torch.tensor(0.0, dtype=dtype, device=device)
+                        for idx in range(range_start, range_end):
+                            g = int(flatten_ids[idx].item())
+                            u_M = ray_flat[g, 0]
+                            v_M = ray_flat[g, 1]
+                            w_M = ray_flat[g, 2]
+                            h_u = px * w_M - u_M
+                            h_v = py * w_M - v_M
+                            ray_cross = torch.cross(h_u, h_v, dim=-1)
+                            if float(ray_cross[2].detach().item()) == 0.0:
+                                continue
+                            s = ray_cross[:2] / ray_cross[2]
+                            gauss_weight_3d = (s * s).sum()
+                            d = means_flat[g] - torch.stack([px, py])
+                            gauss_weight_2d = filter_inv_square * (d * d).sum()
+                            sigma = 0.5 * torch.minimum(gauss_weight_3d, gauss_weight_2d)
+                            alpha = torch.minimum(max_alpha, opacities_flat[g] * torch.exp(-sigma))
+                            if float(sigma.detach().item()) < 0.0 or float(alpha.detach().item()) < float(alpha_threshold.item()):
+                                continue
+                            next_T = T * (1.0 - alpha)
+                            if float(next_T.detach().item()) <= trans_thresh:
+                                break
+
+                            vis = alpha * T
+                            accum = accum + colors_flat[g] * vis
+                            accum_normal = accum_normal + normals_flat[g] * vis
+                            depth = colors_flat[g, -1]
+                            distort = distort + 2.0 * (vis * depth * (1.0 - T) - vis * accum_vis_depth)
+                            accum_vis_depth = accum_vis_depth + vis * depth
+                            T = next_T
+
+                        if backgrounds is not None:
+                            accum = accum + backgrounds.reshape(I, channels)[image_id] * T
+                        render_colors.reshape(I, image_height, image_width, channels)[image_id, i, j] = accum
+                        render_alphas.reshape(I, image_height, image_width, 1)[image_id, i, j, 0] = 1.0 - T
+                        render_normals.reshape(I, image_height, image_width, 3)[image_id, i, j] = accum_normal
+                        render_distort.reshape(I, image_height, image_width, 1)[image_id, i, j, 0] = distort
+
+    return render_colors, render_alphas, render_normals, render_distort
+
+
+def _rasterize_to_pixels_2dgs_absgrad_reference(
+    means2d: torch.Tensor,
+    ray_transforms: torch.Tensor,
+    colors: torch.Tensor,
+    opacities: torch.Tensor,
+    normals: torch.Tensor,
+    image_width: int,
+    image_height: int,
+    tile_size: int,
+    isect_offsets: torch.Tensor,
+    flatten_ids: torch.Tensor,
+    v_render_colors: torch.Tensor,
+    v_render_alphas: torch.Tensor,
+    v_render_normals: torch.Tensor,
+    v_render_distort: torch.Tensor,
+    backgrounds: Optional[torch.Tensor] = None,
+    masks: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    (
+        render_colors,
+        render_alphas,
+        render_normals,
+        render_distort,
+    ) = _rasterize_to_pixels_2dgs_reference_autograd(
+        means2d,
+        ray_transforms,
+        colors,
+        opacities,
+        normals,
+        image_width,
+        image_height,
+        tile_size,
+        isect_offsets,
+        flatten_ids,
+        backgrounds=backgrounds,
+        masks=masks,
+    )
+    absgrad = torch.zeros_like(means2d)
+    image_dims = render_alphas.shape[:-3]
+    shape = (*image_dims, image_height, image_width)
+    for flat_idx in range(math.prod(shape)):
+        unravel = []
+        rem = flat_idx
+        for size in reversed(shape):
+            unravel.append(rem % size)
+            rem //= size
+        index_tuple = tuple(reversed(unravel))
+        scalar = (
+            (render_colors[index_tuple] * v_render_colors[index_tuple]).sum()
+            + (render_alphas[index_tuple + (0,)] * v_render_alphas[index_tuple + (0,)]).sum()
+            + (render_normals[index_tuple] * v_render_normals[index_tuple]).sum()
+            + (render_distort[index_tuple + (0,)] * v_render_distort[index_tuple + (0,)]).sum()
+        )
+        pixel_grad = torch.autograd.grad(scalar, means2d, retain_graph=True)[0]
+        absgrad = absgrad + pixel_grad.abs()
+    return absgrad
+
+
+def _rasterize_to_pixels_2dgs_median_color_grad(
+    v_render_median: Optional[torch.Tensor],
+    median_ids: torch.Tensor,
+    flatten_ids: torch.Tensor,
+    colors_shape: torch.Size,
+) -> torch.Tensor:
+    if v_render_median is None:
+        return torch.zeros(colors_shape, device=median_ids.device, dtype=torch.float32)
+    grad = torch.zeros(colors_shape, device=v_render_median.device, dtype=v_render_median.dtype)
+    grad_flat = grad.reshape(-1, colors_shape[-1])
+    median_vals = v_render_median.reshape(-1)
+    median_ids_flat = median_ids.reshape(-1)
+    for pixel_idx in range(median_ids_flat.numel()):
+        isect_idx = int(median_ids_flat[pixel_idx].item())
+        if isect_idx < 0 or isect_idx >= flatten_ids.numel():
+            continue
+        g = int(flatten_ids[isect_idx].item())
+        grad_flat[g, -1] += median_vals[pixel_idx]
+    return grad
+
+
+class _RasterizeToPixels2DGS(torch.autograd.Function):
+    """Autograd bridge for the Metal 2DGS rasterization op.
+
+    Forward and backward both use native Metal ops.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        means2d,
+        ray_transforms,
+        colors,
+        opacities,
+        normals,
+        densify,
+        backgrounds,
+        masks,
+        width,
+        height,
+        tile_size,
+        isect_offsets,
+        flatten_ids,
+        packed,
+        absgrad,
+        distloss,
+    ):
+        ctx.set_materialize_grads(False)
+        (
+            render_colors,
+            render_alphas,
+            render_normals,
+            render_distort,
+            render_median,
+            last_ids,
+            median_ids,
+        ) = _make_lazy_metal_func("metal_rasterize_to_pixels_2dgs_fwd")(
+            means2d,
+            ray_transforms,
+            colors,
+            opacities,
+            normals,
+            backgrounds,
+            masks,
+            width,
+            height,
+            tile_size,
+            isect_offsets,
+            flatten_ids,
+            packed,
+        )
+        ctx.save_for_backward(
+            means2d,
+            ray_transforms,
+            colors,
+            opacities,
+            normals,
+            densify,
+            backgrounds if backgrounds is not None else torch.empty(0, device=means2d.device, dtype=means2d.dtype),
+            masks if masks is not None else torch.empty(0, device=means2d.device, dtype=torch.bool),
+            isect_offsets,
+            flatten_ids,
+            render_colors,
+            render_alphas,
+            last_ids,
+            median_ids,
+        )
+        ctx.width = width
+        ctx.height = height
+        ctx.tile_size = tile_size
+        ctx.packed = packed
+        ctx.absgrad = absgrad
+        ctx.distloss = distloss
+        ctx.has_backgrounds = backgrounds is not None
+        ctx.has_masks = masks is not None
+        return render_colors, render_alphas, render_normals, render_distort, render_median
+
+    @staticmethod
+    def backward(
+        ctx,
+        v_render_colors,
+        v_render_alphas,
+        v_render_normals,
+        v_render_distort,
+        v_render_median,
+    ):
+        (
+            means2d,
+            ray_transforms,
+            colors,
+            opacities,
+            normals,
+            densify,
+            backgrounds,
+            masks,
+            isect_offsets,
+            flatten_ids,
+            render_colors,
+            render_alphas,
+            last_ids,
+            median_ids,
+        ) = ctx.saved_tensors
+        backgrounds = backgrounds if ctx.has_backgrounds else None
+        masks = masks if ctx.has_masks else None
+
+        if v_render_colors is None:
+            v_render_colors = torch.zeros_like(render_colors)
+        if v_render_alphas is None:
+            v_render_alphas = torch.zeros_like(render_alphas)
+        if v_render_normals is None:
+            v_render_normals = torch.zeros(
+                *render_alphas.shape[:-1], 3, device=render_alphas.device, dtype=render_alphas.dtype
+            )
+        if v_render_distort is None:
+            v_render_distort = torch.zeros_like(render_alphas)
+        if v_render_median is None:
+            v_render_median = torch.zeros_like(render_alphas)
+
+        (
+            v_means2d_abs,
+            v_means2d,
+            v_ray_transforms,
+            v_colors,
+            v_opacities,
+            v_normals,
+            v_densify,
+        ) = _make_lazy_metal_func("metal_rasterize_to_pixels_2dgs_bwd")(
+            means2d,
+            ray_transforms,
+            colors,
+            opacities,
+            normals,
+            densify,
+            backgrounds,
+            masks,
+            ctx.width,
+            ctx.height,
+            ctx.tile_size,
+            isect_offsets,
+            flatten_ids,
+            render_colors,
+            render_alphas,
+            last_ids,
+            median_ids,
+            v_render_colors.contiguous(),
+            v_render_alphas.contiguous(),
+            v_render_normals.contiguous(),
+            v_render_distort.contiguous(),
+            v_render_median.contiguous(),
+            ctx.packed,
+            ctx.absgrad,
+        )
+
+        if ctx.absgrad and v_means2d_abs is not None:
+            means2d.absgrad = v_means2d_abs
+
+        if ctx.needs_input_grad[6]:
+            v_backgrounds = (v_render_colors * (1.0 - render_alphas)).sum(dim=(-3, -2))
+        else:
+            v_backgrounds = None
+        return (
+            v_means2d,
+            v_ray_transforms,
+            v_colors,
+            v_opacities,
+            v_normals,
+            v_densify,
+            v_backgrounds,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+
+
 class _RasterizeToPixels(torch.autograd.Function):
     """Autograd bridge for the Metal 3DGS rasterization op."""
 
@@ -1539,6 +1907,163 @@ def rasterize_to_pixels(
     if padded_channels > 0:
         render_colors = render_colors[..., :-padded_channels]
     return render_colors, render_alphas
+
+
+def rasterize_to_pixels_2dgs(
+    means2d: torch.Tensor,
+    ray_transforms: torch.Tensor,
+    colors: torch.Tensor,
+    opacities: torch.Tensor,
+    normals: torch.Tensor,
+    densify: torch.Tensor,
+    image_width: int,
+    image_height: int,
+    tile_size: int,
+    isect_offsets: torch.Tensor,
+    flatten_ids: torch.Tensor,
+    backgrounds: Optional[torch.Tensor] = None,
+    masks: Optional[torch.Tensor] = None,
+    packed: bool = False,
+    absgrad: bool = False,
+    distloss: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Rasterize projected 2DGS Gaussians to pixels on MPS."""
+    channels = colors.shape[-1]
+    device = means2d.device
+    if device.type != "mps":
+        raise ValueError(f"means2d must be on MPS, got {device}")
+
+    image_dims = isect_offsets.shape[:-2]
+    if packed:
+        nnz = means2d.size(0)
+        if means2d.shape != (nnz, 2):
+            raise ValueError(f"means2d must have shape {(nnz, 2)}, got {means2d.shape}")
+        if ray_transforms.shape != (nnz, 3, 3):
+            raise ValueError(
+                f"ray_transforms must have shape {(nnz, 3, 3)}, got {ray_transforms.shape}"
+            )
+        if colors.shape != (nnz, channels):
+            raise ValueError(f"colors must have shape {(nnz, channels)}, got {colors.shape}")
+        if opacities.shape != (nnz,):
+            raise ValueError(f"opacities must have shape {(nnz,)}, got {opacities.shape}")
+        if normals.shape != (nnz, 3):
+            raise ValueError(f"normals must have shape {(nnz, 3)}, got {normals.shape}")
+        if densify.shape != (nnz, 2):
+            raise ValueError(f"densify must have shape {(nnz, 2)}, got {densify.shape}")
+    else:
+        N = means2d.size(-2)
+        if means2d.shape != image_dims + (N, 2):
+            raise ValueError(f"means2d must have shape {image_dims + (N, 2)}, got {means2d.shape}")
+        if ray_transforms.shape != image_dims + (N, 3, 3):
+            raise ValueError(
+                f"ray_transforms must have shape {image_dims + (N, 3, 3)}, got {ray_transforms.shape}"
+            )
+        if colors.shape != image_dims + (N, channels):
+            raise ValueError(f"colors must have shape {image_dims + (N, channels)}, got {colors.shape}")
+        if opacities.shape != image_dims + (N,):
+            raise ValueError(f"opacities must have shape {image_dims + (N,)}, got {opacities.shape}")
+        if normals.shape != image_dims + (N, 3):
+            raise ValueError(f"normals must have shape {image_dims + (N, 3)}, got {normals.shape}")
+        if densify.shape != image_dims + (N, 2):
+            raise ValueError(f"densify must have shape {image_dims + (N, 2)}, got {densify.shape}")
+    if means2d.dtype != torch.float32 or ray_transforms.dtype != torch.float32:
+        raise ValueError("means2d and ray_transforms must be float32")
+    if colors.dtype != torch.float32 or opacities.dtype != torch.float32:
+        raise ValueError("colors and opacities must be float32")
+    if normals.dtype != torch.float32:
+        raise ValueError(f"normals must be float32, got {normals.dtype}")
+    if densify.dtype != torch.float32:
+        raise ValueError(f"densify must be float32, got {densify.dtype}")
+
+    tile_height, tile_width = isect_offsets.shape[-2:]
+    if isect_offsets.device != device or flatten_ids.device != device:
+        raise ValueError("isect_offsets and flatten_ids must be on the same device as means2d")
+    if isect_offsets.dtype != torch.int32:
+        raise ValueError(f"isect_offsets must be int32, got {isect_offsets.dtype}")
+    if flatten_ids.dtype != torch.int32:
+        raise ValueError(f"flatten_ids must be int32, got {flatten_ids.dtype}")
+
+    if backgrounds is not None:
+        if backgrounds.device != device or backgrounds.dtype != torch.float32:
+            raise ValueError("backgrounds must be float32 on the same device as means2d")
+        if backgrounds.shape != image_dims + (channels,):
+            raise ValueError(f"backgrounds must have shape {image_dims + (channels,)}, got {backgrounds.shape}")
+        backgrounds = backgrounds.contiguous()
+    if masks is not None:
+        if masks.device != device or masks.dtype != torch.bool:
+            raise ValueError("masks must be bool on the same device as means2d")
+        if masks.shape != isect_offsets.shape:
+            raise ValueError(f"masks must have shape {isect_offsets.shape}, got {masks.shape}")
+        masks = masks.contiguous()
+
+    if channels > 512 or channels == 0:
+        raise ValueError(f"Unsupported number of color channels: {channels}")
+    if channels not in (1, 2, 3, 4, 8, 16, 32, 64, 128, 256, 512):
+        padded_channels = (1 << (channels - 1).bit_length()) - channels
+        # Keep the final depth-like channel at the end after padding.
+        colors = torch.cat(
+            [
+                colors[..., :-1],
+                torch.zeros(*colors.shape[:-1], padded_channels, device=device, dtype=colors.dtype),
+                colors[..., -1:],
+            ],
+            dim=-1,
+        )
+        if backgrounds is not None:
+            backgrounds = torch.cat(
+                [
+                    backgrounds[..., :-1],
+                    torch.zeros(
+                        *backgrounds.shape[:-1], padded_channels, device=device, dtype=backgrounds.dtype
+                    ),
+                    backgrounds[..., -1:],
+                ],
+                dim=-1,
+            )
+    else:
+        padded_channels = 0
+
+    if tile_height * tile_size < image_height:
+        raise ValueError(
+            f"tile_height * tile_size must cover image_height, got {tile_height} * {tile_size} < {image_height}"
+        )
+    if tile_width * tile_size < image_width:
+        raise ValueError(
+            f"tile_width * tile_size must cover image_width, got {tile_width} * {tile_size} < {image_width}"
+        )
+
+    (
+        render_colors,
+        render_alphas,
+        render_normals,
+        render_distort,
+        render_median,
+    ) = _RasterizeToPixels2DGS.apply(
+        means2d.contiguous(),
+        ray_transforms.contiguous(),
+        colors.contiguous(),
+        opacities.contiguous(),
+        normals.contiguous(),
+        densify.contiguous(),
+        backgrounds,
+        masks,
+        image_width,
+        image_height,
+        tile_size,
+        isect_offsets.contiguous(),
+        flatten_ids.contiguous(),
+        packed,
+        absgrad,
+        distloss,
+    )
+
+    if padded_channels > 0:
+        render_colors = torch.cat(
+            [render_colors[..., : -padded_channels - 1], render_colors[..., -1:]],
+            dim=-1,
+        )
+
+    return render_colors, render_alphas, render_normals, render_distort, render_median
 
 
 @torch.no_grad()

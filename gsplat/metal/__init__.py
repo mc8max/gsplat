@@ -18,6 +18,7 @@ from ._wrapper import (
     quat_scale_to_covar_preci,
     rasterize_to_indices_in_range,
     rasterize_to_pixels,
+    rasterize_to_pixels_2dgs,
     spherical_harmonics,
 )
 
@@ -36,5 +37,6 @@ __all__ = [
     "quat_scale_to_covar_preci",
     "rasterize_to_indices_in_range",
     "rasterize_to_pixels",
+    "rasterize_to_pixels_2dgs",
     "spherical_harmonics",
 ]
