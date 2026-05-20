@@ -664,12 +664,7 @@ class _FullyFusedProjection(torch.autograd.Function):
 
 
 class _FullyFusedProjection2DGS(torch.autograd.Function):
-    """Autograd bridge for the Metal fused 2DGS projection op.
-
-    Forward runs through the native Metal kernel. Backward currently uses a
-    reference recompute against the PyTorch 2DGS implementation to preserve
-    parity while the native 2DGS VJP is still being hardened.
-    """
+    """Autograd bridge for the Metal fused 2DGS projection op."""
 
     @staticmethod
     def forward(
@@ -709,54 +704,25 @@ class _FullyFusedProjection2DGS(torch.autograd.Function):
     @staticmethod
     def backward(ctx, v_radii, v_means2d, v_depths, v_ray_transforms, v_normals):
         means, quats, scales, viewmats, Ks, radii, ray_transforms = ctx.saved_tensors
-        del v_radii, radii, ray_transforms
-        from gsplat.cuda._torch_impl_2dgs import _fully_fused_projection_2dgs
-
-        with torch.enable_grad():
-            # Stage C keeps a correctness-first backward bridge here so the
-            # public Metal wrapper matches the reference gradient contract even
-            # though the native 2DGS backward kernel is not yet the active path.
-            means_ref = means.detach().clone().requires_grad_(ctx.needs_input_grad[0])
-            quats_ref = quats.detach().clone().requires_grad_(ctx.needs_input_grad[1])
-            scales_ref = scales.detach().clone().requires_grad_(ctx.needs_input_grad[2])
-            viewmats_ref = viewmats.detach().clone().requires_grad_(ctx.needs_input_grad[3])
-            _, means2d_ref, depths_ref, ray_transforms_ref, normals_ref = (
-                _fully_fused_projection_2dgs(
-                    means_ref,
-                    quats_ref,
-                    scales_ref,
-                    viewmats_ref,
-                    Ks.detach(),
-                    ctx.width,
-                    ctx.height,
-                )
-            )
-            loss = (
-                (means2d_ref * v_means2d).sum()
-                + (depths_ref * v_depths).sum()
-                + (ray_transforms_ref * v_ray_transforms).sum()
-                + (normals_ref * v_normals).sum()
-            )
-            grad_inputs = []
-            grad_targets = []
-            if ctx.needs_input_grad[0]:
-                grad_targets.append(means_ref)
-                grad_inputs.append("means")
-            if ctx.needs_input_grad[1]:
-                grad_targets.append(quats_ref)
-                grad_inputs.append("quats")
-            if ctx.needs_input_grad[2]:
-                grad_targets.append(scales_ref)
-                grad_inputs.append("scales")
-            if ctx.needs_input_grad[3]:
-                grad_targets.append(viewmats_ref)
-                grad_inputs.append("viewmats")
-            grad_values = torch.autograd.grad(loss, grad_targets, allow_unused=False)
-            grads = dict(zip(grad_inputs, grad_values))
-        v_means = grads.get("means")
-        v_quats = grads.get("quats")
-        v_scales = grads.get("scales")
-        v_viewmats = grads.get("viewmats")
+        del v_radii
+        v_means, v_quats, v_scales, v_viewmats = _make_lazy_metal_func(
+            "metal_projection_2dgs_fused_bwd"
+        )(
+            means,
+            quats,
+            scales,
+            viewmats,
+            Ks,
+            ctx.width,
+            ctx.height,
+            radii,
+            ray_transforms,
+            v_means2d.contiguous(),
+            v_depths.contiguous(),
+            v_normals.contiguous(),
+            v_ray_transforms.contiguous(),
+            ctx.needs_input_grad[3],  # viewmats_requires_grad
+        )
         if not ctx.needs_input_grad[0]:
             v_means = None
         if not ctx.needs_input_grad[1]:
@@ -777,6 +743,151 @@ class _FullyFusedProjection2DGS(torch.autograd.Function):
             None,
             None,
             None,
+        )
+
+
+class _FullyFusedProjectionPacked2DGS(torch.autograd.Function):
+    """Autograd bridge for packed Metal 2DGS projection op."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        means,
+        quats,
+        scales,
+        viewmats,
+        Ks,
+        width,
+        height,
+        eps2d,
+        near_plane,
+        far_plane,
+        radius_clip,
+        sparse_grad,
+    ):
+        del eps2d
+        (
+            indptr,
+            batch_ids,
+            camera_ids,
+            gaussian_ids,
+            radii,
+            means2d,
+            depths,
+            ray_transforms,
+            normals,
+        ) = _make_lazy_metal_func("metal_projection_2dgs_packed_fwd")(
+            means,
+            quats,
+            scales,
+            viewmats,
+            Ks,
+            width,
+            height,
+            near_plane,
+            far_plane,
+            radius_clip,
+        )
+        ray_transforms = ray_transforms.reshape(-1, 3, 3)
+        ctx.save_for_backward(
+            batch_ids,
+            camera_ids,
+            gaussian_ids,
+            means,
+            quats,
+            scales,
+            viewmats,
+            Ks,
+            ray_transforms,
+        )
+        ctx.width = width
+        ctx.height = height
+        ctx.sparse_grad = sparse_grad
+        return (
+            indptr,
+            batch_ids,
+            camera_ids,
+            gaussian_ids,
+            radii,
+            means2d,
+            depths,
+            ray_transforms,
+            normals,
+        )
+
+    @staticmethod
+    def backward(
+        ctx,
+        v_indptr,
+        v_batch_ids,
+        v_camera_ids,
+        v_gaussian_ids,
+        v_radii,
+        v_means2d,
+        v_depths,
+        v_ray_transforms,
+        v_normals,
+    ):
+        del v_indptr, v_batch_ids, v_camera_ids, v_gaussian_ids, v_radii
+        (
+            batch_ids,
+            camera_ids,
+            gaussian_ids,
+            means,
+            quats,
+            scales,
+            viewmats,
+            Ks,
+            ray_transforms,
+        ) = ctx.saved_tensors
+
+        (
+            v_means,
+            v_quats,
+            v_scales,
+            v_viewmats,
+        ) = _make_lazy_metal_func("metal_projection_2dgs_packed_bwd")(
+            means,
+            quats,
+            scales,
+            viewmats,
+            Ks,
+            ctx.width,
+            ctx.height,
+            batch_ids,
+            camera_ids,
+            gaussian_ids,
+            ray_transforms,
+            v_means2d.contiguous(),
+            v_depths.contiguous(),
+            v_ray_transforms.contiguous(),
+            v_normals.contiguous(),
+            ctx.needs_input_grad[3],  # viewmats_requires_grad
+            ctx.sparse_grad,
+        )
+
+        if not ctx.needs_input_grad[0]:
+            v_means = None
+        if not ctx.needs_input_grad[1]:
+            v_quats = None
+        if not ctx.needs_input_grad[2]:
+            v_scales = None
+        if not ctx.needs_input_grad[3]:
+            v_viewmats = None
+
+        return (
+            v_means,
+            v_quats,
+            v_scales,
+            v_viewmats,
+            None,  # Ks
+            None,  # width
+            None,  # height
+            None,  # eps2d
+            None,  # near_plane
+            None,  # far_plane
+            None,  # radius_clip
+            None,  # sparse_grad
         )
 
 
@@ -1228,9 +1339,23 @@ def fully_fused_projection_2dgs(
 ):
     """Project world-space 2DGS Gaussians to screen-space on MPS."""
 
+    batch_dims = means.shape[:-2]
     if packed:
-        raise NotImplementedError(
-            "Metal fully_fused_projection_2dgs packed=True is not implemented yet."
+        if sparse_grad and batch_dims != ():
+            raise ValueError("sparse_grad does not support batch dimensions when packed=True")
+        return _FullyFusedProjectionPacked2DGS.apply(
+            means.contiguous(),
+            quats.contiguous(),
+            scales.contiguous(),
+            viewmats.contiguous(),
+            Ks.contiguous(),
+            width,
+            height,
+            eps2d,
+            near_plane,
+            far_plane,
+            radius_clip,
+            sparse_grad,
         )
     if sparse_grad:
         raise ValueError("sparse_grad is only supported when packed=True")
@@ -1247,7 +1372,6 @@ def fully_fused_projection_2dgs(
     if viewmats.dtype != torch.float32 or Ks.dtype != torch.float32:
         raise ValueError("viewmats and Ks must be float32")
 
-    batch_dims = means.shape[:-2]
     N = means.shape[-2]
     C = viewmats.shape[-3]
     if means.shape != batch_dims + (N, 3):

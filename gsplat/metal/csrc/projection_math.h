@@ -254,6 +254,95 @@ inline void persp_proj_vjp_metal(
 }
 
 // ---------------------------------------------------------------------------
+// 2DGS ray transform helpers
+// ---------------------------------------------------------------------------
+
+inline void compute_ray_transforms_aabb_vjp_metal(
+    device const float* ray_transforms,
+    device const float* v_means2d,
+    float3 v_normals,
+    float3x3 W,
+    float3x3 P,
+    float3 cam_pos,
+    float3 mean_w,
+    float3 mean_c,
+    float4 quat,
+    float2 scale,
+    thread float3x3& v_ray_transforms,
+    thread float4& v_quat,
+    thread float2& v_scale,
+    thread float3& v_mean,
+    thread float3x3& v_R,
+    thread float3& v_t
+) {
+    (void)cam_pos;
+    if (v_means2d[0] != 0.0f || v_means2d[1] != 0.0f) {
+        const float distance = ray_transforms[6] * ray_transforms[6] +
+                               ray_transforms[7] * ray_transforms[7] -
+                               ray_transforms[8] * ray_transforms[8];
+        const float f = 1.0f / distance;
+        const float dpx_dT00 = f * ray_transforms[6];
+        const float dpx_dT01 = f * ray_transforms[7];
+        const float dpx_dT02 = -f * ray_transforms[8];
+        const float dpy_dT10 = f * ray_transforms[6];
+        const float dpy_dT11 = f * ray_transforms[7];
+        const float dpy_dT12 = -f * ray_transforms[8];
+        const float dpx_dd =
+            -f * f *
+            (ray_transforms[0] * ray_transforms[6] +
+             ray_transforms[1] * ray_transforms[7] -
+             ray_transforms[2] * ray_transforms[8]);
+        const float dpx_dT30 = ray_transforms[0] * f + 2.0f * dpx_dd * ray_transforms[6];
+        const float dpx_dT31 = ray_transforms[1] * f + 2.0f * dpx_dd * ray_transforms[7];
+        const float dpx_dT32 = -ray_transforms[2] * f - 2.0f * dpx_dd * ray_transforms[8];
+        const float dpy_dd =
+            -f * f *
+            (ray_transforms[3] * ray_transforms[6] +
+             ray_transforms[4] * ray_transforms[7] -
+             ray_transforms[5] * ray_transforms[8]);
+        const float dpy_dT30 = ray_transforms[3] * f + 2.0f * dpy_dd * ray_transforms[6];
+        const float dpy_dT31 = ray_transforms[4] * f + 2.0f * dpy_dd * ray_transforms[7];
+        const float dpy_dT32 = -ray_transforms[5] * f - 2.0f * dpy_dd * ray_transforms[8];
+
+        v_ray_transforms[0][0] += v_means2d[0] * dpx_dT00;
+        v_ray_transforms[0][1] += v_means2d[0] * dpx_dT01;
+        v_ray_transforms[0][2] += v_means2d[0] * dpx_dT02;
+        v_ray_transforms[1][0] += v_means2d[1] * dpy_dT10;
+        v_ray_transforms[1][1] += v_means2d[1] * dpy_dT11;
+        v_ray_transforms[1][2] += v_means2d[1] * dpy_dT12;
+        v_ray_transforms[2][0] += v_means2d[0] * dpx_dT30 + v_means2d[1] * dpy_dT30;
+        v_ray_transforms[2][1] += v_means2d[0] * dpx_dT31 + v_means2d[1] * dpy_dT31;
+        v_ray_transforms[2][2] += v_means2d[0] * dpx_dT32 + v_means2d[1] * dpy_dT32;
+    }
+
+    float3x3 R = quat_to_rotmat(quat);
+    float3x3 v_M = P * transpose(v_ray_transforms);
+    float3x3 W_t = transpose(W);
+    float3x3 v_RS = W_t * v_M;
+    float3 v_tn = W_t * v_normals;
+
+    float3 tn = W * R[2];
+    float multiplier = dot(-tn, mean_c) > 0.0f ? 1.0f : -1.0f;
+    v_tn *= multiplier;
+
+    float3x3 v_Rot = float3x3(v_RS[0] * scale.x, v_RS[1] * scale.y, v_tn);
+
+    v_quat += quat_to_rotmat_vjp(quat, v_Rot);
+    v_scale.x += dot(v_RS[0], R[0]);
+    v_scale.y += dot(v_RS[1], R[1]);
+
+    v_mean += v_RS[2];
+
+    v_R += outer3(v_M[2], mean_w);
+
+    float3x3 RS = quat_to_rotmat(quat) * make_diag(float3(scale.x, scale.y, 1.0f));
+    float3x3 v_RS_cam = float3x3(v_M[0], v_M[1], v_normals * multiplier);
+
+    v_R += v_RS_cam * transpose(RS);
+    v_t += v_M[2];
+}
+
+// ---------------------------------------------------------------------------
 // Fisheye projection
 // ---------------------------------------------------------------------------
 
