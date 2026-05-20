@@ -15,6 +15,7 @@ from ._wrapper import (
     metal_null,
     projection_ewa_simple,
     quat_scale_to_covar_preci,
+    rasterize_to_indices_in_range,
     rasterize_to_pixels,
     spherical_harmonics,
 )
@@ -31,6 +32,7 @@ __all__ = [
     "metal_null",
     "projection_ewa_simple",
     "quat_scale_to_covar_preci",
+    "rasterize_to_indices_in_range",
     "rasterize_to_pixels",
     "spherical_harmonics",
 ]

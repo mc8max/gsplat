@@ -1355,3 +1355,87 @@ def rasterize_to_pixels(
     if padded_channels > 0:
         render_colors = render_colors[..., :-padded_channels]
     return render_colors, render_alphas
+
+
+@torch.no_grad()
+def rasterize_to_indices_in_range(
+    range_start: int,
+    range_end: int,
+    transmittances: torch.Tensor,
+    means2d: torch.Tensor,
+    conics: torch.Tensor,
+    opacities: torch.Tensor,
+    image_width: int,
+    image_height: int,
+    tile_size: int,
+    isect_offsets: torch.Tensor,
+    flatten_ids: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Rasterize a Gaussian batch range and return only hit indices on MPS."""
+
+    image_dims = means2d.shape[:-2]
+    tile_height, tile_width = isect_offsets.shape[-2:]
+    N = means2d.shape[-2]
+
+    if means2d.device.type != "mps":
+        raise ValueError(f"means2d must be on MPS, got {means2d.device}")
+    if transmittances.shape != image_dims + (image_height, image_width):
+        raise ValueError(
+            f"transmittances must have shape {image_dims + (image_height, image_width)}, "
+            f"got {transmittances.shape}"
+        )
+    if means2d.shape != image_dims + (N, 2):
+        raise ValueError(f"means2d must have shape {image_dims + (N, 2)}, got {means2d.shape}")
+    if conics.shape != image_dims + (N, 3):
+        raise ValueError(f"conics must have shape {image_dims + (N, 3)}, got {conics.shape}")
+    if opacities.shape != image_dims + (N,):
+        raise ValueError(f"opacities must have shape {image_dims + (N,)}, got {opacities.shape}")
+    if isect_offsets.shape != image_dims + (tile_height, tile_width):
+        raise ValueError(
+            f"isect_offsets must have shape {image_dims + (tile_height, tile_width)}, "
+            f"got {isect_offsets.shape}"
+        )
+    if transmittances.device != means2d.device:
+        raise ValueError("transmittances must be on the same device as means2d")
+    if conics.device != means2d.device or opacities.device != means2d.device:
+        raise ValueError("conics and opacities must be on the same device as means2d")
+    if isect_offsets.device != means2d.device or flatten_ids.device != means2d.device:
+        raise ValueError("isect_offsets and flatten_ids must be on the same device as means2d")
+    if transmittances.dtype != torch.float32:
+        raise ValueError(f"transmittances must be float32, got {transmittances.dtype}")
+    if means2d.dtype != torch.float32 or conics.dtype != torch.float32:
+        raise ValueError("means2d and conics must be float32")
+    if opacities.dtype != torch.float32:
+        raise ValueError(f"opacities must be float32, got {opacities.dtype}")
+    if isect_offsets.dtype != torch.int32:
+        raise ValueError(f"isect_offsets must be int32, got {isect_offsets.dtype}")
+    if flatten_ids.dtype != torch.int32:
+        raise ValueError(f"flatten_ids must be int32, got {flatten_ids.dtype}")
+    if tile_height * tile_size < image_height:
+        raise ValueError(
+            f"tile_height * tile_size must cover image_height, got "
+            f"{tile_height} * {tile_size} < {image_height}"
+        )
+    if tile_width * tile_size < image_width:
+        raise ValueError(
+            f"tile_width * tile_size must cover image_width, got "
+            f"{tile_width} * {tile_size} < {image_width}"
+        )
+
+    out_gauss_ids, out_indices = _make_lazy_metal_func("metal_rasterize_to_indices_3dgs")(
+        range_start,
+        range_end,
+        transmittances.contiguous(),
+        means2d.contiguous(),
+        conics.contiguous(),
+        opacities.contiguous(),
+        image_width,
+        image_height,
+        tile_size,
+        isect_offsets.contiguous(),
+        flatten_ids.contiguous(),
+    )
+    pixels_per_image = image_width * image_height
+    out_pixel_ids = out_indices % pixels_per_image
+    out_image_ids = out_indices // pixels_per_image
+    return out_gauss_ids, out_pixel_ids, out_image_ids
