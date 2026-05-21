@@ -13,7 +13,7 @@
 #include "MetalContext.h"
 #include "MPSTensor.h"
 #include "rasterize_to_indices_common.h"
-#include "rasterize_to_indices_3dgs.h"
+#include "rasterize_to_indices_2dgs.h"
 
 namespace gsplat::metal {
 
@@ -24,7 +24,7 @@ RasterizeIndicesConfig validate_common(
     int64_t range_end,
     const at::Tensor& transmittances,
     const at::Tensor& means2d,
-    const at::Tensor& conics,
+    const at::Tensor& ray_transforms,
     const at::Tensor& opacities,
     int64_t image_width,
     int64_t image_height,
@@ -34,7 +34,7 @@ RasterizeIndicesConfig validate_common(
 ) {
     check_mps_float32(transmittances, "transmittances");
     check_mps_float32(means2d, "means2d");
-    check_mps_float32(conics, "conics");
+    check_mps_float32(ray_transforms, "ray_transforms");
     check_mps_float32(opacities, "opacities");
     check_mps_int32(tile_offsets, "tile_offsets");
     check_mps_int32(flatten_ids, "flatten_ids");
@@ -46,29 +46,35 @@ RasterizeIndicesConfig validate_common(
     TORCH_CHECK(tile_size > 0, "tile_size must be positive");
     TORCH_CHECK(
         static_cast<uint64_t>(tile_size) * static_cast<uint64_t>(tile_size) <= 256u,
-        "Metal rasterize_to_indices currently requires tile_size^2 <= 256");
+        "Metal rasterize_to_indices_2dgs currently requires tile_size^2 <= 256");
     TORCH_CHECK(means2d.dim() >= 3, "means2d must have shape [..., N, 2]");
     TORCH_CHECK(means2d.size(-1) == 2, "means2d last dimension must be 2");
-    TORCH_CHECK(conics.sizes().slice(0, conics.dim() - 1) == means2d.sizes().slice(0, means2d.dim() - 1), "conics shape must match means2d except last dim");
-    TORCH_CHECK(conics.size(-1) == 3, "conics last dimension must be 3");
 
     const auto image_dims = tile_offsets.sizes().slice(0, tile_offsets.dim() - 2);
     TORCH_CHECK(
         means2d.sizes().slice(0, means2d.dim() - 2) == image_dims,
         "means2d image dims must match tile_offsets");
+
+    const int64_t N = means2d.size(-2);
+    auto expected_rt = image_dims.vec();
+    expected_rt.push_back(N);
+    expected_rt.push_back(3);
+    expected_rt.push_back(3);
     TORCH_CHECK(
-        conics.sizes().slice(0, conics.dim() - 2) == image_dims,
-        "conics image dims must match tile_offsets");
-    TORCH_CHECK(
-        opacities.sizes().slice(0, opacities.dim() - 1) == image_dims &&
-            opacities.size(-1) == means2d.size(-2),
-        "opacities must have shape [..., N]");
+        ray_transforms.sizes().vec() == expected_rt,
+        "ray_transforms must have shape [..., N, 3, 3]");
+
+    auto expected_opacities = image_dims.vec();
+    expected_opacities.push_back(N);
+    TORCH_CHECK(opacities.sizes().vec() == expected_opacities, "opacities must have shape [..., N]");
 
     auto expected_trans = image_dims.vec();
     expected_trans.push_back(image_height);
     expected_trans.push_back(image_width);
     TORCH_CHECK(transmittances.sizes().vec() == expected_trans, "transmittances shape mismatch");
-    TORCH_CHECK(tile_offsets.dim() >= 2, "tile_offsets must have shape [..., tile_height, tile_width]");
+    TORCH_CHECK(
+        tile_offsets.dim() >= 2,
+        "tile_offsets must have shape [..., tile_height, tile_width]");
     TORCH_CHECK(flatten_ids.dim() == 1, "flatten_ids must be 1D");
 
     const int64_t tile_height = tile_offsets.size(-2);
@@ -80,7 +86,7 @@ RasterizeIndicesConfig validate_common(
 
     RasterizeIndicesConfig cfg{};
     cfg.I = product_i64_to_u32(image_dims, "tile_offsets");
-    cfg.N = static_cast<uint32_t>(means2d.size(-2));
+    cfg.N = static_cast<uint32_t>(N);
     cfg.tile_size = static_cast<uint32_t>(tile_size);
     cfg.tile_width = static_cast<uint32_t>(tile_width);
     cfg.tile_height = static_cast<uint32_t>(tile_height);
@@ -92,12 +98,12 @@ RasterizeIndicesConfig validate_common(
 
 }  // namespace
 
-std::tuple<at::Tensor, at::Tensor> rasterize_to_indices_3dgs_op(
+std::tuple<at::Tensor, at::Tensor> rasterize_to_indices_2dgs_op(
     int64_t range_start,
     int64_t range_end,
     const at::Tensor& transmittances,
     const at::Tensor& means2d,
-    const at::Tensor& conics,
+    const at::Tensor& ray_transforms,
     const at::Tensor& opacities,
     int64_t image_width,
     int64_t image_height,
@@ -110,7 +116,7 @@ std::tuple<at::Tensor, at::Tensor> rasterize_to_indices_3dgs_op(
         range_end,
         transmittances,
         means2d,
-        conics,
+        ray_transforms,
         opacities,
         image_width,
         image_height,
@@ -139,7 +145,7 @@ std::tuple<at::Tensor, at::Tensor> rasterize_to_indices_3dgs_op(
     const uint32_t image_width_u32 = static_cast<uint32_t>(image_width);
     const uint32_t image_height_u32 = static_cast<uint32_t>(image_height);
 
-    id<MTLComputePipelineState> count_pso = ctx.pipeline("rasterize_to_indices_3dgs_count_kernel");
+    id<MTLComputePipelineState> count_pso = ctx.pipeline("rasterize_to_indices_2dgs_count_kernel");
     TORCH_CHECK(
         cfg.tile_size * cfg.tile_size <= static_cast<uint32_t>(count_pso.maxTotalThreadsPerThreadgroup),
         "tile_size^2 exceeds the pipeline threadgroup limit");
@@ -150,7 +156,7 @@ std::tuple<at::Tensor, at::Tensor> rasterize_to_indices_3dgs_op(
             [enc setComputePipelineState:count_pso];
             [enc setBuffer:to_mtl_buffer(transmittances) offset:byte_offset(transmittances) atIndex:0];
             [enc setBuffer:to_mtl_buffer(means2d) offset:byte_offset(means2d) atIndex:1];
-            [enc setBuffer:to_mtl_buffer(conics) offset:byte_offset(conics) atIndex:2];
+            [enc setBuffer:to_mtl_buffer(ray_transforms) offset:byte_offset(ray_transforms) atIndex:2];
             [enc setBuffer:to_mtl_buffer(opacities) offset:byte_offset(opacities) atIndex:3];
             [enc setBuffer:to_mtl_buffer(tile_offsets) offset:byte_offset(tile_offsets) atIndex:4];
             [enc setBuffer:to_mtl_buffer(flatten_ids) offset:byte_offset(flatten_ids) atIndex:5];
@@ -175,8 +181,6 @@ std::tuple<at::Tensor, at::Tensor> rasterize_to_indices_3dgs_op(
     // before allocating gaussian_ids and pixel_ids.
     mps_stream->synchronize(at::mps::SyncType::COMMIT_AND_WAIT);
 
-    // Mirror CUDA's two-pass compaction: count contributors per pixel, then
-    // prefix-sum to allocate a tight output buffer for the emit pass.
     at::Tensor cumsum = at::cumsum(chunk_cnts, 0, at::kInt);
     const int32_t n_elems = cumsum.numel() > 0 ? cumsum[-1].item<int32_t>() : 0;
     if (n_elems == 0) {
@@ -187,7 +191,7 @@ std::tuple<at::Tensor, at::Tensor> rasterize_to_indices_3dgs_op(
     gaussian_ids = at::empty({n_elems}, means2d.options().dtype(at::kLong));
     pixel_ids = at::empty({n_elems}, means2d.options().dtype(at::kLong));
 
-    id<MTLComputePipelineState> emit_pso = ctx.pipeline("rasterize_to_indices_3dgs_emit_kernel");
+    id<MTLComputePipelineState> emit_pso = ctx.pipeline("rasterize_to_indices_2dgs_emit_kernel");
     TORCH_CHECK(
         cfg.tile_size * cfg.tile_size <= static_cast<uint32_t>(emit_pso.maxTotalThreadsPerThreadgroup),
         "tile_size^2 exceeds the pipeline threadgroup limit");
@@ -198,7 +202,7 @@ std::tuple<at::Tensor, at::Tensor> rasterize_to_indices_3dgs_op(
             [enc setComputePipelineState:emit_pso];
             [enc setBuffer:to_mtl_buffer(transmittances) offset:byte_offset(transmittances) atIndex:0];
             [enc setBuffer:to_mtl_buffer(means2d) offset:byte_offset(means2d) atIndex:1];
-            [enc setBuffer:to_mtl_buffer(conics) offset:byte_offset(conics) atIndex:2];
+            [enc setBuffer:to_mtl_buffer(ray_transforms) offset:byte_offset(ray_transforms) atIndex:2];
             [enc setBuffer:to_mtl_buffer(opacities) offset:byte_offset(opacities) atIndex:3];
             [enc setBuffer:to_mtl_buffer(tile_offsets) offset:byte_offset(tile_offsets) atIndex:4];
             [enc setBuffer:to_mtl_buffer(flatten_ids) offset:byte_offset(flatten_ids) atIndex:5];

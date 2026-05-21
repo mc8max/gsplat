@@ -4,6 +4,7 @@
 #pragma once
 
 #include <metal_stdlib>
+#include "metal_math.h"
 
 using namespace metal;
 

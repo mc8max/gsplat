@@ -17,6 +17,7 @@
 #include "ops/rasterize_to_pixels_2dgs.h"
 #include "ops/rasterize_to_pixels_3dgs.h"
 #include "ops/rasterize_to_indices_3dgs.h"
+#include "ops/rasterize_to_indices_2dgs.h"
 #include "ops/spherical_harmonics.h"
 #include "ops/sort_int64.h"
 
@@ -183,6 +184,12 @@ TORCH_LIBRARY_FRAGMENT(gsplat, m) {
         "Tensor conics, Tensor opacities, int image_width, int image_height, "
         "int tile_size, Tensor tile_offsets, Tensor flatten_ids"
         ") -> (Tensor, Tensor)");
+    m.def(
+        "metal_rasterize_to_indices_2dgs("
+        "int range_start, int range_end, Tensor transmittances, Tensor means2d, "
+        "Tensor ray_transforms, Tensor opacities, int image_width, int image_height, "
+        "int tile_size, Tensor tile_offsets, Tensor flatten_ids"
+        ") -> (Tensor, Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(gsplat, MPS, m) {
@@ -207,6 +214,7 @@ TORCH_LIBRARY_IMPL(gsplat, MPS, m) {
     m.impl("metal_rasterize_to_pixels_3dgs_fwd", &rasterize_to_pixels_3dgs_fwd_op);
     m.impl("metal_rasterize_to_pixels_3dgs_bwd", &rasterize_to_pixels_3dgs_bwd_op);
     m.impl("metal_rasterize_to_indices_3dgs", &rasterize_to_indices_3dgs_op);
+    m.impl("metal_rasterize_to_indices_2dgs", &rasterize_to_indices_2dgs_op);
     m.impl("metal_null", &null_op);
     m.impl(
         "metal_quat_scale_to_covar_preci_fwd",
