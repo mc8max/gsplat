@@ -16,6 +16,7 @@
 #include "ops/quat_scale_to_covar_preci.h"
 #include "ops/rasterize_to_pixels_2dgs.h"
 #include "ops/rasterize_to_pixels_3dgs.h"
+#include "ops/rasterize_to_pixels_from_world_3dgs.h"
 #include "ops/rasterize_to_indices_3dgs.h"
 #include "ops/rasterize_to_indices_2dgs.h"
 #include "ops/spherical_harmonics.h"
@@ -179,6 +180,21 @@ TORCH_LIBRARY_FRAGMENT(gsplat, m) {
         "Tensor last_ids, Tensor v_render_colors, Tensor v_render_alphas, bool absgrad"
         ") -> (Tensor?, Tensor, Tensor, Tensor, Tensor)");
     m.def(
+        "metal_rasterize_to_pixels_from_world_3dgs_fwd("
+        "Tensor means, Tensor quats, Tensor scales, Tensor colors, Tensor opacities, "
+        "Tensor? backgrounds, Tensor? masks, int image_width, int image_height, "
+        "int tile_size, Tensor viewmats, Tensor Ks, Tensor? rays, Tensor tile_offsets, Tensor flatten_ids, "
+        "Tensor? sample_counts, Tensor? render_normals, bool use_hit_distance"
+        ") -> (Tensor, Tensor, Tensor)");
+    m.def(
+        "metal_rasterize_to_pixels_from_world_3dgs_bwd("
+        "Tensor means, Tensor quats, Tensor scales, Tensor colors, Tensor opacities, "
+        "Tensor? backgrounds, Tensor? masks, int image_width, int image_height, "
+        "int tile_size, Tensor viewmats, Tensor Ks, Tensor? rays, Tensor tile_offsets, Tensor flatten_ids, "
+        "Tensor render_alphas, Tensor last_ids, Tensor v_render_colors, "
+        "Tensor v_render_alphas, Tensor? v_render_normals, bool use_hit_distance"
+        ") -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)");
+    m.def(
         "metal_rasterize_to_indices_3dgs("
         "int range_start, int range_end, Tensor transmittances, Tensor means2d, "
         "Tensor conics, Tensor opacities, int image_width, int image_height, "
@@ -213,6 +229,8 @@ TORCH_LIBRARY_IMPL(gsplat, MPS, m) {
     m.impl("metal_rasterize_to_pixels_2dgs_bwd", &rasterize_to_pixels_2dgs_bwd_op);
     m.impl("metal_rasterize_to_pixels_3dgs_fwd", &rasterize_to_pixels_3dgs_fwd_op);
     m.impl("metal_rasterize_to_pixels_3dgs_bwd", &rasterize_to_pixels_3dgs_bwd_op);
+    m.impl("metal_rasterize_to_pixels_from_world_3dgs_fwd", &rasterize_to_pixels_from_world_3dgs_fwd_op);
+    m.impl("metal_rasterize_to_pixels_from_world_3dgs_bwd", &rasterize_to_pixels_from_world_3dgs_bwd_op);
     m.impl("metal_rasterize_to_indices_3dgs", &rasterize_to_indices_3dgs_op);
     m.impl("metal_rasterize_to_indices_2dgs", &rasterize_to_indices_2dgs_op);
     m.impl("metal_null", &null_op);

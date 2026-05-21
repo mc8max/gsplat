@@ -11,6 +11,15 @@ from typing import Optional
 
 import torch
 
+from gsplat._camera_types import (
+    BivariateWindshieldModelParameters,
+    CameraModel,
+    FThetaCameraDistortionParameters,
+    RollingShutterType,
+    RowOffsetStructuredSpinningLidarModelParametersExt,
+    UnscentedTransformParameters,
+)
+
 from ._backend import load
 @dataclass(frozen=True)
 class _IntersectTileInputs:
@@ -81,6 +90,86 @@ def distort_camera_rays(
         reference_poly,
         inverse,
     )
+
+
+def _synthesize_eval3d_world_rays(
+    viewmats: torch.Tensor,
+    Ks: torch.Tensor,
+    width: int,
+    height: int,
+    camera_model: CameraModel,
+    radial_coeffs: Optional[torch.Tensor] = None,
+    tangential_coeffs: Optional[torch.Tensor] = None,
+    thin_prism_coeffs: Optional[torch.Tensor] = None,
+    ftheta_coeffs: Optional[FThetaCameraDistortionParameters] = None,
+    external_distortion_coeffs: Optional[BivariateWindshieldModelParameters] = None,
+    rolling_shutter: RollingShutterType = RollingShutterType.GLOBAL,
+    viewmats_rs: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    from gsplat.cuda._torch_cameras import (
+        _BaseCameraModel,
+        _interpolate_shutter_pose,
+        _pose_camera_ray_to_world_ray,
+        _viewmat_to_pose,
+    )
+
+    batch_dims = viewmats.shape[:-3]
+    c = viewmats.shape[-3]
+    flat_count = math.prod(batch_dims) * c
+    device = viewmats.device
+    dtype = viewmats.dtype
+
+    viewmats_flat = viewmats.reshape(flat_count, 4, 4)
+    Ks_flat = Ks.reshape(flat_count, 3, 3)
+    focal_lengths = torch.stack([Ks_flat[:, 0, 0], Ks_flat[:, 1, 1]], dim=-1)
+    principal_points = torch.stack([Ks_flat[:, 0, 2], Ks_flat[:, 1, 2]], dim=-1)
+
+    grid_x = torch.arange(width, device=device, dtype=dtype) + 0.5
+    grid_y = torch.arange(height, device=device, dtype=dtype) + 0.5
+    px, py = torch.meshgrid(grid_x, grid_y, indexing="xy")
+    image_points = torch.stack([px, py], dim=-1).reshape(1, height * width, 2)
+    image_points = image_points.expand(flat_count, -1, -1)
+
+    camera = _BaseCameraModel.create(
+        width=width,
+        height=height,
+        camera_model=camera_model,
+        principal_points=principal_points,
+        focal_lengths=None if camera_model == "ftheta" else focal_lengths,
+        radial_coeffs=radial_coeffs.reshape(flat_count, -1) if radial_coeffs is not None else None,
+        tangential_coeffs=tangential_coeffs.reshape(flat_count, 2) if tangential_coeffs is not None else None,
+        thin_prism_coeffs=thin_prism_coeffs.reshape(flat_count, 4) if thin_prism_coeffs is not None else None,
+        ftheta_coeffs=ftheta_coeffs,
+        rs_type=rolling_shutter,
+    )
+    camera_rays, valid = camera.image_point_to_camera_ray(image_points)
+
+    if external_distortion_coeffs is not None:
+        camera_rays = distort_camera_rays(
+            camera_rays.reshape(-1, 3),
+            external_distortion_coeffs.horizontal_poly.to(device=device, dtype=dtype),
+            external_distortion_coeffs.vertical_poly.to(device=device, dtype=dtype),
+            external_distortion_coeffs.horizontal_poly_inverse.to(device=device, dtype=dtype),
+            external_distortion_coeffs.vertical_poly_inverse.to(device=device, dtype=dtype),
+            int(external_distortion_coeffs.reference_poly),
+            True,
+        ).reshape(flat_count, height * width, 3)
+
+    pose_start = _viewmat_to_pose(viewmats_flat)
+    pose_end = _viewmat_to_pose(
+        (viewmats_rs if viewmats_rs is not None else viewmats).reshape(flat_count, 4, 4)
+    )
+    relative_time = camera.shutter_relative_frame_time(image_points)
+    pose = _interpolate_shutter_pose(
+        pose_start[:, None, :],
+        pose_end[:, None, :],
+        relative_time,
+    )
+    ray_o, ray_d = _pose_camera_ray_to_world_ray(pose, camera_rays)
+    ray_o = ray_o * valid[..., None]
+    ray_d = ray_d * valid[..., None]
+    rays = torch.cat([ray_o, ray_d], dim=-1)
+    return rays.reshape(batch_dims + (c, height, width, 6))
 
 
 def intersect_offset_encode(
@@ -1893,6 +1982,467 @@ class _RasterizeToPixels(torch.autograd.Function):
             None,
             None,
         )
+
+
+class _RasterizeToPixelsEval3D(torch.autograd.Function):
+    """Autograd bridge for the Metal explicit-rays world-space 3DGS rasterizer."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        means,
+        quats,
+        scales,
+        colors,
+        opacities,
+        backgrounds,
+        masks,
+        viewmats,
+        Ks,
+        width,
+        height,
+        tile_size,
+        isect_offsets,
+        flatten_ids,
+        camera_model,
+        ut_params,
+        rays,
+        radial_coeffs,
+        tangential_coeffs,
+        thin_prism_coeffs,
+        ftheta_coeffs,
+        lidar_coeffs,
+        external_distortion_coeffs,
+        rolling_shutter,
+        viewmats_rs,
+        return_sample_counts,
+        use_hit_distance,
+        return_normals,
+    ):
+        ctx.set_materialize_grads(False)
+
+        batch_dims = means.shape[:-2]
+        c = colors.shape[-3]
+        sample_counts = None
+        render_normals = None
+        if return_sample_counts:
+            sample_counts = torch.empty(
+                batch_dims + (c, height, width), dtype=torch.int32, device=means.device
+            )
+        if return_normals:
+            render_normals = torch.empty(
+                batch_dims + (c, height, width, 3),
+                dtype=means.dtype,
+                device=means.device,
+            )
+
+        render_colors, render_alphas, last_ids = _make_lazy_metal_func(
+            "metal_rasterize_to_pixels_from_world_3dgs_fwd"
+        )(
+            means,
+            quats,
+            scales,
+            colors,
+            opacities,
+            backgrounds,
+            masks,
+            width,
+            height,
+            tile_size,
+            viewmats,
+            Ks,
+            rays,
+            isect_offsets,
+            flatten_ids,
+            sample_counts,
+            render_normals,
+            use_hit_distance,
+        )
+        ctx.save_for_backward(
+            means,
+            quats,
+            scales,
+            colors,
+            opacities,
+            backgrounds
+            if backgrounds is not None
+            else torch.empty(0, device=means.device, dtype=means.dtype),
+            masks
+            if masks is not None
+            else torch.empty(0, device=means.device, dtype=torch.bool),
+            viewmats,
+            Ks,
+            rays if rays is not None else torch.empty(0, device=means.device, dtype=means.dtype),
+            isect_offsets,
+            flatten_ids,
+            render_alphas,
+            last_ids,
+        )
+        ctx.width = width
+        ctx.height = height
+        ctx.tile_size = tile_size
+        ctx.has_backgrounds = backgrounds is not None
+        ctx.has_masks = masks is not None
+        ctx.has_rays = rays is not None
+        ctx.return_normals = return_normals
+        ctx.use_hit_distance = use_hit_distance
+        return render_colors, render_alphas, last_ids, sample_counts, render_normals
+
+    @staticmethod
+    def backward(
+        ctx,
+        v_render_colors,
+        v_render_alphas,
+        v_last_ids,
+        v_sample_counts,
+        v_render_normals,
+    ):
+        del v_last_ids, v_sample_counts
+        (
+            means,
+            quats,
+            scales,
+            colors,
+            opacities,
+            backgrounds,
+            masks,
+            viewmats,
+            Ks,
+            rays,
+            isect_offsets,
+            flatten_ids,
+            render_alphas,
+            last_ids,
+        ) = ctx.saved_tensors
+        backgrounds = backgrounds if ctx.has_backgrounds else None
+        masks = masks if ctx.has_masks else None
+        rays = rays if ctx.has_rays else None
+
+        if v_render_colors is None:
+            v_render_colors = torch.zeros(
+                render_alphas.shape[:-1] + (colors.shape[-1],),
+                device=render_alphas.device,
+                dtype=render_alphas.dtype,
+            )
+        if v_render_alphas is None:
+            v_render_alphas = torch.zeros_like(render_alphas)
+
+        (
+            v_means,
+            v_quats,
+            v_scales,
+            v_colors,
+            v_opacities,
+            v_rays,
+        ) = _make_lazy_metal_func("metal_rasterize_to_pixels_from_world_3dgs_bwd")(
+            means,
+            quats,
+            scales,
+            colors,
+            opacities,
+            backgrounds,
+            masks,
+            ctx.width,
+            ctx.height,
+            ctx.tile_size,
+            viewmats,
+            Ks,
+            rays,
+            isect_offsets,
+            flatten_ids,
+            render_alphas,
+            last_ids,
+            v_render_colors.contiguous(),
+            v_render_alphas.contiguous(),
+            v_render_normals.contiguous() if v_render_normals is not None else None,
+            ctx.use_hit_distance,
+        )
+        if not ctx.has_rays:
+            v_rays = None
+
+        if ctx.needs_input_grad[5]:
+            v_backgrounds = (v_render_colors * (1.0 - render_alphas)).sum(dim=(-3, -2))
+        else:
+            v_backgrounds = None
+
+        return (
+            v_means,
+            v_quats,
+            v_scales,
+            v_colors,
+            v_opacities,
+            v_backgrounds,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            v_rays,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+
+
+def rasterize_to_pixels_eval3d(
+    means: torch.Tensor,
+    quats: torch.Tensor,
+    scales: torch.Tensor,
+    colors: torch.Tensor,
+    opacities: torch.Tensor,
+    viewmats: torch.Tensor,
+    Ks: torch.Tensor,
+    width: int,
+    height: int,
+    tile_size: int,
+    isect_offsets: torch.Tensor,
+    flatten_ids: torch.Tensor,
+    backgrounds: Optional[torch.Tensor] = None,
+    masks: Optional[torch.Tensor] = None,
+    camera_model: CameraModel = "pinhole",
+    ut_params: Optional[UnscentedTransformParameters] = None,
+    rays: Optional[torch.Tensor] = None,
+    radial_coeffs: Optional[torch.Tensor] = None,
+    tangential_coeffs: Optional[torch.Tensor] = None,
+    thin_prism_coeffs: Optional[torch.Tensor] = None,
+    ftheta_coeffs: Optional[FThetaCameraDistortionParameters] = None,
+    lidar_coeffs: Optional[RowOffsetStructuredSpinningLidarModelParametersExt] = None,
+    external_distortion_coeffs: Optional[BivariateWindshieldModelParameters] = None,
+    rolling_shutter: RollingShutterType = RollingShutterType.GLOBAL,
+    viewmats_rs: Optional[torch.Tensor] = None,
+    return_sample_counts: bool = False,
+    use_hit_distance: bool = False,
+    return_normals: bool = False,
+):
+    """Rasterize 3D Gaussians in world space on MPS using explicit per-pixel rays.
+
+    Current Metal support is intentionally narrow:
+    - unpacked inputs only
+    - supports explicit `rays` or wrapper-synthesized world rays
+    - supports pinhole, fisheye, and ftheta ray synthesis
+    - supports OpenCV pinhole/fisheye distortion coefficients
+    - supports rolling shutter via `viewmats_rs`
+    - supports external distortion
+    - no lidar
+    - rendered normals supported
+    - hit-distance mode supported
+    """
+
+    if means.device.type != "mps":
+        raise ValueError(f"means must be on MPS, got {means.device}")
+    if camera_model == "ortho":
+        raise NotImplementedError("Metal currently does not support the ortho camera model")
+    if camera_model == "lidar" or lidar_coeffs is not None:
+        raise NotImplementedError("Metal currently does not support lidar camera model")
+
+    batch_dims = means.shape[:-2]
+    n = means.shape[-2]
+    c = viewmats.shape[-3]
+    channels = colors.shape[-1]
+    image_dims = batch_dims + (c,)
+
+    if means.shape != batch_dims + (n, 3):
+        raise ValueError(f"means must have shape {batch_dims + (n, 3)}, got {means.shape}")
+    if quats.shape != batch_dims + (n, 4):
+        raise ValueError(f"quats must have shape {batch_dims + (n, 4)}, got {quats.shape}")
+    if scales.shape != batch_dims + (n, 3):
+        raise ValueError(f"scales must have shape {batch_dims + (n, 3)}, got {scales.shape}")
+    if colors.shape != image_dims + (n, channels):
+        raise ValueError(f"colors must have shape {image_dims + (n, channels)}, got {colors.shape}")
+    if opacities.shape != image_dims + (n,):
+        raise ValueError(f"opacities must have shape {image_dims + (n,)}, got {opacities.shape}")
+    if viewmats.shape != image_dims + (4, 4):
+        raise ValueError(f"viewmats must have shape {image_dims + (4, 4)}, got {viewmats.shape}")
+    if Ks.shape != image_dims + (3, 3):
+        raise ValueError(f"Ks must have shape {image_dims + (3, 3)}, got {Ks.shape}")
+    if rays is not None and rays.shape != image_dims + (height, width, 6):
+        raise ValueError(f"rays must have shape {image_dims + (height, width, 6)}, got {rays.shape}")
+    if isect_offsets.shape[:-2] != image_dims:
+        raise ValueError(
+            f"isect_offsets image dims must match {image_dims}, got {isect_offsets.shape[:-2]}"
+        )
+    if means.dtype != torch.float32 or quats.dtype != torch.float32 or scales.dtype != torch.float32:
+        raise ValueError("means, quats, and scales must be float32")
+    if colors.dtype != torch.float32 or opacities.dtype != torch.float32:
+        raise ValueError("colors and opacities must be float32")
+    if viewmats.dtype != torch.float32 or Ks.dtype != torch.float32:
+        raise ValueError("viewmats and Ks must be float32")
+    if rays is not None and rays.dtype != torch.float32:
+        raise ValueError("rays must be float32")
+    if isect_offsets.device != means.device or flatten_ids.device != means.device:
+        raise ValueError("isect_offsets and flatten_ids must be on the same device as means")
+    if isect_offsets.dtype != torch.int32 or flatten_ids.dtype != torch.int32:
+        raise ValueError("isect_offsets and flatten_ids must be int32")
+    if rays is not None and rays.device != means.device:
+        raise ValueError("rays must be on the same device as means")
+    if backgrounds is not None:
+        if backgrounds.device != means.device or backgrounds.dtype != torch.float32:
+            raise ValueError("backgrounds must be float32 on the same device as means")
+        if backgrounds.shape != image_dims + (channels,):
+            raise ValueError(
+                f"backgrounds must have shape {image_dims + (channels,)}, got {backgrounds.shape}"
+            )
+        backgrounds = backgrounds.contiguous()
+    if masks is not None:
+        if masks.device != means.device or masks.dtype != torch.bool:
+            raise ValueError("masks must be bool on the same device as means")
+        if masks.shape != isect_offsets.shape:
+            raise ValueError(f"masks must have shape {isect_offsets.shape}, got {masks.shape}")
+        masks = masks.contiguous()
+    if radial_coeffs is not None:
+        expected_last = 4 if camera_model == "fisheye" else 6
+        if radial_coeffs.device != means.device or radial_coeffs.dtype != torch.float32:
+            raise ValueError("radial_coeffs must be float32 on the same device as means")
+        if radial_coeffs.shape != image_dims + (expected_last,):
+            raise ValueError(
+                f"radial_coeffs must have shape {image_dims + (expected_last,)}, got {radial_coeffs.shape}"
+            )
+        radial_coeffs = radial_coeffs.contiguous()
+    if tangential_coeffs is not None:
+        if tangential_coeffs.device != means.device or tangential_coeffs.dtype != torch.float32:
+            raise ValueError("tangential_coeffs must be float32 on the same device as means")
+        if tangential_coeffs.shape != image_dims + (2,):
+            raise ValueError(
+                f"tangential_coeffs must have shape {image_dims + (2,)}, got {tangential_coeffs.shape}"
+            )
+        tangential_coeffs = tangential_coeffs.contiguous()
+    if thin_prism_coeffs is not None:
+        if thin_prism_coeffs.device != means.device or thin_prism_coeffs.dtype != torch.float32:
+            raise ValueError("thin_prism_coeffs must be float32 on the same device as means")
+        if thin_prism_coeffs.shape != image_dims + (4,):
+            raise ValueError(
+                f"thin_prism_coeffs must have shape {image_dims + (4,)}, got {thin_prism_coeffs.shape}"
+            )
+        thin_prism_coeffs = thin_prism_coeffs.contiguous()
+    if viewmats_rs is not None:
+        if viewmats_rs.device != means.device or viewmats_rs.dtype != torch.float32:
+            raise ValueError("viewmats_rs must be float32 on the same device as means")
+        if viewmats_rs.shape != image_dims + (4, 4):
+            raise ValueError(f"viewmats_rs must have shape {image_dims + (4, 4)}, got {viewmats_rs.shape}")
+        viewmats_rs = viewmats_rs.contiguous()
+    if rolling_shutter != RollingShutterType.GLOBAL and viewmats_rs is None:
+        raise ValueError("viewmats_rs is required when rolling_shutter is not GLOBAL")
+
+    if rays is None:
+        rays = _synthesize_eval3d_world_rays(
+            viewmats=viewmats.contiguous(),
+            Ks=Ks.contiguous(),
+            width=width,
+            height=height,
+            camera_model=camera_model,
+            radial_coeffs=radial_coeffs,
+            tangential_coeffs=tangential_coeffs,
+            thin_prism_coeffs=thin_prism_coeffs,
+            ftheta_coeffs=ftheta_coeffs,
+            external_distortion_coeffs=external_distortion_coeffs,
+            rolling_shutter=rolling_shutter,
+            viewmats_rs=viewmats_rs,
+        )
+
+    if channels > 513 or channels == 0:
+        raise ValueError(f"Unsupported number of color channels: {channels}")
+    if channels not in (
+        1,
+        2,
+        3,
+        4,
+        5,
+        8,
+        9,
+        16,
+        17,
+        32,
+        33,
+        64,
+        65,
+        128,
+        129,
+        256,
+        257,
+        512,
+        513,
+    ):
+        padded_channels = (1 << (channels - 1).bit_length()) - channels
+        colors = torch.cat(
+            [
+                colors[..., :-1],
+                torch.zeros(*colors.shape[:-1], padded_channels, device=means.device),
+                colors[..., -1:],
+            ],
+            dim=-1,
+        )
+        if backgrounds is not None:
+            backgrounds = torch.cat(
+                [
+                    backgrounds,
+                    torch.zeros(*backgrounds.shape[:-1], padded_channels, device=means.device),
+                ],
+                dim=-1,
+            )
+    else:
+        padded_channels = 0
+
+    tile_height, tile_width = isect_offsets.shape[-2:]
+    if tile_height * tile_size < height:
+        raise ValueError(
+            f"tile_height * tile_size must cover image_height, got {tile_height} * {tile_size} < {height}"
+        )
+    if tile_width * tile_size < width:
+        raise ValueError(
+            f"tile_width * tile_size must cover image_width, got {tile_width} * {tile_size} < {width}"
+        )
+
+    render_colors, render_alphas, last_ids, sample_counts, render_normals = (
+        _RasterizeToPixelsEval3D.apply(
+            means.contiguous(),
+            quats.contiguous(),
+            scales.contiguous(),
+            colors.contiguous(),
+            opacities.contiguous(),
+            backgrounds,
+            masks,
+            viewmats.contiguous(),
+            Ks.contiguous(),
+            width,
+            height,
+            tile_size,
+            isect_offsets.contiguous(),
+            flatten_ids.contiguous(),
+            camera_model,
+            ut_params,
+            rays.contiguous(),
+            radial_coeffs.contiguous() if radial_coeffs is not None else None,
+            tangential_coeffs.contiguous() if tangential_coeffs is not None else None,
+            thin_prism_coeffs.contiguous() if thin_prism_coeffs is not None else None,
+            ftheta_coeffs,
+            lidar_coeffs,
+            external_distortion_coeffs,
+            rolling_shutter,
+            viewmats_rs,
+            return_sample_counts,
+            use_hit_distance,
+            return_normals,
+        )
+    )
+    if padded_channels > 0:
+        render_colors = torch.cat(
+            [render_colors[..., : -padded_channels - 1], render_colors[..., -1:]],
+            dim=-1,
+        )
+    return render_colors, render_alphas, last_ids, sample_counts, render_normals
 
 
 def rasterize_to_pixels(
