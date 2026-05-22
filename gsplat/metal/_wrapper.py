@@ -21,6 +21,8 @@ from gsplat._camera_types import (
 )
 
 from ._backend import load
+
+
 @dataclass(frozen=True)
 class _IntersectTileInputs:
     I: int
@@ -494,6 +496,28 @@ def _sparse_coo_grad(indices: torch.Tensor, values: torch.Tensor, size, *, is_co
     )
 
 
+def _coerce_projection_2dgs_inputs(
+    means: torch.Tensor,
+    quats: torch.Tensor,
+    scales: torch.Tensor,
+    viewmats: torch.Tensor,
+    Ks: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Move auxiliary projection inputs onto the means device for Metal execution."""
+
+    if means.device.type != "mps":
+        raise ValueError(f"means must be on MPS, got {means.device}")
+    if means.dtype != torch.float32:
+        raise ValueError(f"means must be float32, got {means.dtype}")
+
+    device = means.device
+    quats = quats.to(device=device, dtype=torch.float32)
+    scales = scales.to(device=device, dtype=torch.float32)
+    viewmats = viewmats.to(device=device, dtype=torch.float32)
+    Ks = Ks.to(device=device, dtype=torch.float32)
+    return means, quats, scales, viewmats, Ks
+
+
 class _QuatScaleToCovarPreci(torch.autograd.Function):
     """Autograd bridge for the Metal quat-scale-to-covariance/precision op."""
     
@@ -863,7 +887,7 @@ class _FullyFusedProjectionPacked2DGS(torch.autograd.Function):
             radii,
             means2d,
             depths,
-            ray_transforms,
+            ray_transforms_flat,
             normals,
         ) = _make_lazy_metal_func("metal_projection_2dgs_packed_fwd")(
             means,
@@ -877,7 +901,7 @@ class _FullyFusedProjectionPacked2DGS(torch.autograd.Function):
             far_plane,
             radius_clip,
         )
-        ray_transforms = ray_transforms.reshape(-1, 3, 3)
+        ray_transforms = ray_transforms_flat.reshape(-1, 3, 3)
         ctx.save_for_backward(
             batch_ids,
             camera_ids,
@@ -887,7 +911,7 @@ class _FullyFusedProjectionPacked2DGS(torch.autograd.Function):
             scales,
             viewmats,
             Ks,
-            ray_transforms,
+            ray_transforms_flat,
         )
         ctx.width = width
         ctx.height = height
@@ -927,9 +951,8 @@ class _FullyFusedProjectionPacked2DGS(torch.autograd.Function):
             scales,
             viewmats,
             Ks,
-            ray_transforms,
+            ray_transforms_flat,
         ) = ctx.saved_tensors
-
         (
             v_means,
             v_quats,
@@ -946,21 +969,50 @@ class _FullyFusedProjectionPacked2DGS(torch.autograd.Function):
             batch_ids,
             camera_ids,
             gaussian_ids,
-            ray_transforms,
+            ray_transforms_flat,
             v_means2d.contiguous(),
             v_depths.contiguous(),
-            v_ray_transforms.contiguous(),
+            v_ray_transforms.contiguous().reshape(-1, 9),
             v_normals.contiguous(),
             ctx.needs_input_grad[3],  # viewmats_requires_grad
             ctx.sparse_grad,
         )
 
-        if not ctx.needs_input_grad[0]:
-            v_means = None
-        if not ctx.needs_input_grad[1]:
-            v_quats = None
-        if not ctx.needs_input_grad[2]:
-            v_scales = None
+        if ctx.sparse_grad:
+            if ctx.needs_input_grad[0]:
+                v_means = _sparse_coo_grad(
+                    gaussian_ids[None],
+                    v_means,
+                    means.shape,
+                    is_coalesced=len(viewmats) == 1,
+                )
+            else:
+                v_means = None
+            if ctx.needs_input_grad[1]:
+                v_quats = _sparse_coo_grad(
+                    gaussian_ids[None],
+                    v_quats,
+                    quats.shape,
+                    is_coalesced=len(viewmats) == 1,
+                )
+            else:
+                v_quats = None
+            if ctx.needs_input_grad[2]:
+                v_scales = _sparse_coo_grad(
+                    gaussian_ids[None],
+                    v_scales,
+                    scales.shape,
+                    is_coalesced=len(viewmats) == 1,
+                )
+            else:
+                v_scales = None
+        else:
+            if not ctx.needs_input_grad[0]:
+                v_means = None
+            if not ctx.needs_input_grad[1]:
+                v_quats = None
+            if not ctx.needs_input_grad[2]:
+                v_scales = None
         if not ctx.needs_input_grad[3]:
             v_viewmats = None
 
@@ -1428,6 +1480,9 @@ def fully_fused_projection_2dgs(
 ):
     """Project world-space 2DGS Gaussians to screen-space on MPS."""
 
+    means, quats, scales, viewmats, Ks = _coerce_projection_2dgs_inputs(
+        means, quats, scales, viewmats, Ks
+    )
     batch_dims = means.shape[:-2]
     if packed:
         if sparse_grad and batch_dims != ():
@@ -1448,19 +1503,6 @@ def fully_fused_projection_2dgs(
         )
     if sparse_grad:
         raise ValueError("sparse_grad is only supported when packed=True")
-    if means.device.type != "mps":
-        raise ValueError(f"means must be on MPS, got {means.device}")
-    if means.dtype != torch.float32:
-        raise ValueError(f"means must be float32, got {means.dtype}")
-    if quats.device != means.device or scales.device != means.device:
-        raise ValueError("quats and scales must be on the same device as means")
-    if viewmats.device != means.device or Ks.device != means.device:
-        raise ValueError("viewmats and Ks must be on the same device as means")
-    if quats.dtype != torch.float32 or scales.dtype != torch.float32:
-        raise ValueError("quats and scales must be float32")
-    if viewmats.dtype != torch.float32 or Ks.dtype != torch.float32:
-        raise ValueError("viewmats and Ks must be float32")
-
     N = means.shape[-2]
     C = viewmats.shape[-3]
     if means.shape != batch_dims + (N, 3):

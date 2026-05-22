@@ -181,7 +181,7 @@ kernel void projection_2dgs_fused_bwd_kernel(
     float3 mean_c = R * mean_w + t;
 
     float4 quat = float4(quat_ptr[0], quat_ptr[1], quat_ptr[2], quat_ptr[3]);
-    float2 scale = float2(scale_ptr[0], scale_ptr[1]);
+    float3 scale = float3(scale_ptr[0], scale_ptr[1], scale_ptr[2]);
     // Match the CUDA helper exactly: this is not the usual row-major K matrix,
     // but the specific column-major layout used by compute_ray_transforms_aabb_vjp.
     float3x3 P = float3x3(
@@ -190,12 +190,16 @@ kernel void projection_2dgs_fused_bwd_kernel(
         float3(0.0f, 0.0f, 1.0f)
     );
 
-    float3x3 v_rt = load_mat3_row_major(v_ray_transform_ptr);
+    float3x3 v_rt = float3x3(
+        float3(v_ray_transform_ptr[0], v_ray_transform_ptr[1], v_ray_transform_ptr[2]),
+        float3(v_ray_transform_ptr[3], v_ray_transform_ptr[4], v_ray_transform_ptr[5]),
+        float3(v_ray_transform_ptr[6], v_ray_transform_ptr[7], v_ray_transform_ptr[8])
+    );
     v_rt[2][2] += v_depths[id];
     float3 v_normal = float3(v_normals_ptr[0], v_normals_ptr[1], v_normals_ptr[2]);
 
     float3 v_mean = float3(0.0f);
-    float2 v_scale = float2(0.0f);
+    float3 v_scale = float3(0.0f);
     float4 v_quat = float4(0.0f);
     float3x3 v_R = float3x3(0.0f);
     float3 v_t = float3(0.0f);
@@ -232,7 +236,7 @@ kernel void projection_2dgs_fused_bwd_kernel(
     device float* tmp_scale_ptr = tmp_scales + id * 3u;
     tmp_scale_ptr[0] = v_scale.x;
     tmp_scale_ptr[1] = v_scale.y;
-    tmp_scale_ptr[2] = 0.0f;
+    tmp_scale_ptr[2] = v_scale.z;
 
     if (viewmats_requires_grad != 0u && tmp_viewmats != nullptr) {
         device float* tmp_viewmat_ptr = tmp_viewmats + id * 16u;

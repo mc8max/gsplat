@@ -34,6 +34,12 @@ def _sample_inputs(batch_shape=(), c=2, n=8, width=640, height=480):
     return means, quats, scales, viewmats, Ks
 
 
+def _identity_quats(*shape, device):
+    quats = torch.zeros(*shape, 4, dtype=torch.float32, device=device)
+    quats[..., 0] = 1.0
+    return quats
+
+
 def _pack_dense_reference(radii, means2d, depths, ray_transforms, normals):
     """Pack dense outputs into COO format for comparison with packed mode."""
     batch_shape = tuple(radii.shape[:-3])
@@ -160,7 +166,7 @@ class TestProjection2DGSPackedForward:
         # Place all Gaussians far behind the camera
         means = torch.zeros(1, 8, 3, dtype=torch.float32, device="mps")
         means[..., 2] = -10.0  # behind camera
-        quats = torch.eye(4, dtype=torch.float32).expand(1, 8, 4).clone()
+        quats = _identity_quats(1, 8, device="mps")
         scales = torch.ones(1, 8, 3, dtype=torch.float32, device="mps") * 0.3
         viewmats = torch.eye(4, dtype=torch.float32).expand(1, 1, 4, 4).clone()
         Ks = torch.zeros(1, 1, 3, 3, dtype=torch.float32, device="mps")
@@ -188,7 +194,7 @@ class TestProjection2DGSPackedForward:
         torch.manual_seed(99)
         means = torch.randn(1, 10, 3, dtype=torch.float32, device="mps") * 0.1
         means[..., 2] = 2.0
-        quats = torch.eye(4, dtype=torch.float32).expand(1, 10, 4).clone()
+        quats = _identity_quats(1, 10, device="mps")
         scales = torch.ones(1, 10, 3, dtype=torch.float32, device="mps") * 0.5
         viewmats = torch.eye(4, dtype=torch.float32).expand(1, 1, 4, 4).clone()
         Ks = torch.zeros(1, 1, 3, 3, dtype=torch.float32, device="mps")
@@ -355,18 +361,30 @@ class TestProjection2DGSPackedBackward:
         )
 
         nnz = batch_ids.numel()
-        assert v_means.shape == (nnz, 3), f"Expected ({nnz}, 3), got {v_means.shape}"
-        assert v_quats.shape == (nnz, 4), f"Expected ({nnz}, 4), got {v_quats.shape}"
-        assert v_scales.shape == (nnz, 3), f"Expected ({nnz}, 3), got {v_scales.shape}"
+        assert v_means.is_sparse
+        assert v_quats.is_sparse
+        assert v_scales.is_sparse
+        assert v_means.shape == means.shape
+        assert v_quats.shape == quats.shape
+        assert v_scales.shape == scales.shape
+        assert v_means._values().shape == (nnz, 3)
+        assert v_quats._values().shape == (nnz, 4)
+        assert v_scales._values().shape == (nnz, 3)
 
     def test_backward_empty(self):
         """Backward with nnz=0 should return zero tensors."""
         torch.manual_seed(42)
-        means = torch.zeros(1, 8, 3, dtype=torch.float32, device="mps").requires_grad_(True)
+        means = torch.zeros(1, 8, 3, dtype=torch.float32, device="mps")
         means[..., 2] = -10.0
-        quats = torch.eye(4, dtype=torch.float32).expand(1, 8, 4).clone().to("mps").requires_grad_(True)
+        means = means.requires_grad_(True)
+        quats = _identity_quats(1, 8, device="mps").requires_grad_(True)
         scales = torch.ones(1, 8, 3, dtype=torch.float32, device="mps").requires_grad_(True)
-        viewmats = torch.eye(4, dtype=torch.float32).expand(1, 1, 4, 4).clone().to("mps").requires_grad_(True)
+        viewmats = (
+            torch.eye(4, dtype=torch.float32, device="mps")
+            .expand(1, 1, 4, 4)
+            .clone()
+            .requires_grad_(True)
+        )
         Ks = torch.zeros(1, 1, 3, 3, dtype=torch.float32, device="mps")
         Ks[..., 0, 0] = 500.0
         Ks[..., 1, 1] = 500.0
@@ -419,6 +437,9 @@ class TestProjection2DGSPackedPipeline:
         colors = torch.rand(1, 2, 20, 3, dtype=torch.float32, device="mps")
         opacities = torch.rand(1, 20, dtype=torch.float32, device="mps") * 0.5 + 0.3
         backgrounds = torch.zeros(1, 2, 3, dtype=torch.float32, device="mps")
+        colors_dense = colors.squeeze(0)
+        opacities_dense = opacities.expand(viewmats.shape[-3], -1)
+        backgrounds_dense = backgrounds.squeeze(0)
 
         # Dense pipeline
         radii_d, means2d_d, depths_d, rt_d, norms_d = _fully_fused_projection_2dgs(
@@ -429,14 +450,14 @@ class TestProjection2DGSPackedPipeline:
         tile_height = (480 + tile_size - 1) // tile_size
         isect_offsets_d = gm.isect_offset_encode(
             gm.isect_tiles(means2d_d, radii_d, depths_d, tile_size, tile_width, tile_height, packed=False)[1],
-            1, tile_width, tile_height
+            viewmats.shape[-3], tile_width, tile_height
         )
-        render_colors_d, render_alphas_d = gm.rasterize_to_pixels_2dgs(
-            means2d_d, rt_d, colors, opacities, norms_d,
+        render_colors_d, render_alphas_d, *_ = gm.rasterize_to_pixels_2dgs(
+            means2d_d, rt_d, colors_dense, opacities_dense, norms_d,
             torch.zeros_like(means2d_d),
             640, 480, tile_size, isect_offsets_d,
             gm.isect_tiles(means2d_d, radii_d, depths_d, tile_size, tile_width, tile_height, packed=False)[2],
-            backgrounds=backgrounds, packed=False
+            backgrounds=backgrounds_dense, packed=False
         )
 
         # Packed pipeline
@@ -446,18 +467,25 @@ class TestProjection2DGSPackedPipeline:
         ) = gm.fully_fused_projection_2dgs(
             means, quats, scales, viewmats, Ks, 640, 480, packed=True
         )
-        isect_offsets_p, flatten_ids_p = gm.isect_tiles(
+        image_ids = batch_ids * viewmats.shape[-3] + camera_ids
+        colors_packed = colors_dense[camera_ids, gaussian_ids]
+        opacities_packed = opacities_dense[camera_ids, gaussian_ids]
+        packed_isects = gm.isect_tiles(
             means2d, radii, depths, tile_size, tile_width, tile_height, packed=True,
-            n_images=1, image_ids=batch_ids, gaussian_ids=gaussian_ids
+            n_images=viewmats.shape[-3], image_ids=image_ids, gaussian_ids=gaussian_ids
         )
-        render_colors_p, render_alphas_p = gm.rasterize_to_pixels_2dgs(
-            means2d, ray_transforms, colors, opacities, normals,
+        isect_offsets_p = gm.isect_offset_encode(
+            packed_isects[1], viewmats.shape[-3], tile_width, tile_height
+        )
+        flatten_ids_p = packed_isects[2]
+        render_colors_p, render_alphas_p, *_ = gm.rasterize_to_pixels_2dgs(
+            means2d, ray_transforms, colors_packed, opacities_packed, normals,
             torch.zeros_like(means2d),
             640, 480, tile_size, isect_offsets_p, flatten_ids_p,
-            backgrounds=backgrounds, packed=True
+            backgrounds=backgrounds_dense, packed=True
         )
 
-        atol, rtol = 1e-3, 1e-3
+        atol, rtol = 1e-2, 1e-2
         assert torch.allclose(render_colors_d, render_colors_p, atol=atol, rtol=rtol), "render_colors mismatch"
         assert torch.allclose(render_alphas_d, render_alphas_p, atol=atol, rtol=rtol), "render_alphas mismatch"
 

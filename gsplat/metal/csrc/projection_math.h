@@ -268,10 +268,10 @@ inline void compute_ray_transforms_aabb_vjp_metal(
     float3 mean_w,
     float3 mean_c,
     float4 quat,
-    float2 scale,
+    float3 scale,
     thread float3x3& v_ray_transforms,
     thread float4& v_quat,
-    thread float2& v_scale,
+    thread float3& v_scale,
     thread float3& v_mean,
     thread float3x3& v_R,
     thread float3& v_t
@@ -326,19 +326,17 @@ inline void compute_ray_transforms_aabb_vjp_metal(
     float multiplier = dot(-tn, mean_c) > 0.0f ? 1.0f : -1.0f;
     v_tn *= multiplier;
 
-    float3x3 v_Rot = float3x3(v_RS[0] * scale.x, v_RS[1] * scale.y, v_tn);
-
+    float3x3 v_Rot = float3x3(v_RS[0] * scale.x, v_RS[1] * scale.y, v_tn * scale.z);
     v_quat += quat_to_rotmat_vjp(quat, v_Rot);
     v_scale.x += dot(v_RS[0], R[0]);
     v_scale.y += dot(v_RS[1], R[1]);
+    v_scale.z += dot(v_tn, R[2]);
 
     v_mean += v_RS[2];
 
     v_R += outer3(v_M[2], mean_w);
-
-    float3x3 RS = quat_to_rotmat(quat) * make_diag(float3(scale.x, scale.y, 1.0f));
+    float3x3 RS = quat_to_rotmat(quat) * make_diag(scale);
     float3x3 v_RS_cam = float3x3(v_M[0], v_M[1], v_normals * multiplier);
-
     v_R += v_RS_cam * transpose(RS);
     v_t += v_M[2];
 }

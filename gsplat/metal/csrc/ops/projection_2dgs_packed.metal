@@ -80,11 +80,12 @@ inline bool project_2dgs_candidate(
         float3(K_ptr[2], K_ptr[5], K_ptr[8])
     );
     float3x3 T_sl = K * T_cl;
+    float3x3 M = transpose(T_sl);
 
     const float3 temp_point = float3(1.0f, 1.0f, -1.0f);
-    float3 M0 = T_sl[0];
-    float3 M1 = T_sl[1];
-    float3 M2 = T_sl[2];
+    float3 M0 = M[0];
+    float3 M1 = M[1];
+    float3 M2 = M[2];
     float distance = dot(temp_point * M2, M2);
     if (distance == 0.0f) {
         return false;
@@ -259,13 +260,13 @@ kernel void projection_2dgs_packed_emit_kernel(
     means2d[slot * 2u + 1u] = out.means2d.y;
     depths[slot] = out.depth;
     ray_transforms[slot * 9u] = out.rt00;
-    ray_transforms[slot * 9u + 1u] = out.rt01;
-    ray_transforms[slot * 9u + 2u] = out.rt02;
-    ray_transforms[slot * 9u + 3u] = out.rt10;
+    ray_transforms[slot * 9u + 1u] = out.rt10;
+    ray_transforms[slot * 9u + 2u] = out.rt20;
+    ray_transforms[slot * 9u + 3u] = out.rt01;
     ray_transforms[slot * 9u + 4u] = out.rt11;
-    ray_transforms[slot * 9u + 5u] = out.rt12;
-    ray_transforms[slot * 9u + 6u] = out.rt20;
-    ray_transforms[slot * 9u + 7u] = out.rt21;
+    ray_transforms[slot * 9u + 5u] = out.rt21;
+    ray_transforms[slot * 9u + 6u] = out.rt02;
+    ray_transforms[slot * 9u + 7u] = out.rt12;
     ray_transforms[slot * 9u + 8u] = out.rt22;
     normals[slot * 3u] = out.normal.x;
     normals[slot * 3u + 1u] = out.normal.y;
@@ -331,7 +332,7 @@ kernel void projection_2dgs_packed_bwd_kernel(
     float3 mean_c = R * mean_w + t;
 
     float4 quat = float4(quat_ptr[0], quat_ptr[1], quat_ptr[2], quat_ptr[3]);
-    float2 scale = float2(scale_ptr[0], scale_ptr[1]);
+    float3 scale = float3(scale_ptr[0], scale_ptr[1], scale_ptr[2]);
 
     // P matrix: match CUDA compute_ray_transforms_aabb_vjp layout
     float3x3 P = float3x3(
@@ -341,13 +342,17 @@ kernel void projection_2dgs_packed_bwd_kernel(
     );
 
     // Accumulate v_depth into v_ray_transforms[2][2]
-    float3x3 v_rt = load_mat3_row_major(v_rt_ptr);
+    float3x3 v_rt = float3x3(
+        float3(v_rt_ptr[0], v_rt_ptr[1], v_rt_ptr[2]),
+        float3(v_rt_ptr[3], v_rt_ptr[4], v_rt_ptr[5]),
+        float3(v_rt_ptr[6], v_rt_ptr[7], v_rt_ptr[8])
+    );
     v_rt[2][2] += v_depth_ptr[0];
 
     float3 v_normal = float3(v_norm_ptr[0], v_norm_ptr[1], v_norm_ptr[2]);
 
     float3 v_mean = float3(0.0f);
-    float2 v_scale = float2(0.0f);
+    float3 v_scale = float3(0.0f);
     float4 v_quat = float4(0.0f);
     float3x3 v_R = float3x3(0.0f);
     float3 v_t = float3(0.0f);
@@ -386,7 +391,7 @@ kernel void projection_2dgs_packed_bwd_kernel(
     device float* tmp_scale_ptr = tmp_scales + id * 3u;
     tmp_scale_ptr[0] = v_scale.x;
     tmp_scale_ptr[1] = v_scale.y;
-    tmp_scale_ptr[2] = 0.0f;
+    tmp_scale_ptr[2] = v_scale.z;
 
     if (viewmats_requires_grad != 0u && tmp_viewmats != nullptr) {
         device float* tmp_viewmat_ptr = tmp_viewmats + id * 16u;

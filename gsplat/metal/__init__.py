@@ -24,12 +24,17 @@ from ._wrapper import (
     spherical_harmonics,
 )
 
+isect_offset_encode = intersect_offset_encode
+isect_tiles = intersect_tiles
+
 __all__ = [
     "distort_camera_rays",
     "eval_bivariate_poly",
     "fully_fused_projection",
     "fully_fused_projection_2dgs",
     "has_metal",
+    "isect_offset_encode",
+    "isect_tiles",
     "intersect_offset_encode",
     "intersect_tile_count",
     "intersect_tile_emit",
