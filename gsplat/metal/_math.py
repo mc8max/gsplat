@@ -13,6 +13,7 @@ from gsplat.cuda._torch_impl import (
     _persp_proj,
     _spherical_harmonics,
 )
+from gsplat.cuda._torch_impl_eval3d import _rasterize_to_pixels_eval3d
 from gsplat.cuda._torch_impl_2dgs import _fully_fused_projection_2dgs
 
 __all__ = [
@@ -24,5 +25,6 @@ __all__ = [
     "_ortho_proj",
     "_persp_proj",
     "_quat_scale_to_covar_preci",
+    "_rasterize_to_pixels_eval3d",
     "_spherical_harmonics",
 ]

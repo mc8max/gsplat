@@ -8,7 +8,6 @@ import torch
 
 import gsplat.metal as gm
 from gsplat._camera_types import RollingShutterType
-from gsplat.cuda._math import _quat_to_rotmat, _safe_normalize
 from gsplat.cuda._torch_cameras import (
     _BaseCameraModel,
     _interpolate_shutter_pose,
@@ -16,7 +15,13 @@ from gsplat.cuda._torch_cameras import (
     _viewmat_to_pose,
 )
 from gsplat.cuda._torch_external_distortion import make_params
-from gsplat.metal._math import _fully_fused_projection, _isect_offset_encode, _isect_tiles
+from gsplat.metal._math import (
+    _fully_fused_projection,
+    _isect_offset_encode,
+    _isect_tiles,
+    _quat_scale_to_covar_preci,
+    _rasterize_to_pixels_eval3d,
+)
 
 pytestmark = pytest.mark.skipif(
     not torch.backends.mps.is_available(), reason="MPS required"
@@ -45,22 +50,21 @@ def _sample_inputs(width=24, height=16, tile_size=8, c=2, n=6, channels=5):
     opacities = torch.rand(c, n, dtype=torch.float32) * 0.45 + 0.35
     backgrounds = torch.rand(c, channels, dtype=torch.float32)
 
+    covars, _ = _quat_scale_to_covar_preci(
+        quats, scales, compute_covar=True, compute_preci=False, triu=False
+    )
     radii, means2d, depths, _conics, _comp = _fully_fused_projection(
         means,
-        None,
-        quats,
-        scales,
-        None,
+        covars,
         viewmats,
         Ks,
         width,
         height,
-        0.3,
-        0.01,
-        1e10,
-        0.0,
-        False,
-        "pinhole",
+        eps2d=0.3,
+        near_plane=0.01,
+        far_plane=1e10,
+        calc_compensations=False,
+        camera_model="pinhole",
     )
     _, isect_ids, flatten_ids = _isect_tiles(
         means2d,
@@ -181,6 +185,8 @@ def _reference_eval3d(
     scales,
     colors,
     opacities,
+    viewmats,
+    ks,
     rays,
     image_width,
     image_height,
@@ -192,111 +198,27 @@ def _reference_eval3d(
     use_hit_distance=False,
     return_normals=False,
 ):
-    c = colors.shape[0]
-    n = means.shape[0]
-    channels = colors.shape[-1]
-    tile_height, tile_width = isect_offsets.shape[-2:]
-    n_isects = int(flatten_ids.numel())
-    offsets_flat = isect_offsets.reshape(c * tile_height * tile_width)
-
-    render_colors = torch.zeros(c, image_height, image_width, channels, dtype=means.dtype)
-    render_alphas = torch.zeros(c, image_height, image_width, 1, dtype=means.dtype)
-    last_ids = torch.full((c, image_height, image_width), -1, dtype=torch.int32)
-    sample_counts = torch.zeros(c, image_height, image_width, dtype=torch.int32)
-    render_normals = (
-        torch.zeros(c, image_height, image_width, 3, dtype=means.dtype)
-        if return_normals
-        else None
+    pytest.importorskip("nerfacc", reason="eval3d torch reference requires nerfacc")
+    return _rasterize_to_pixels_eval3d(
+        means,
+        quats,
+        scales,
+        colors,
+        opacities,
+        viewmats,
+        ks,
+        image_width,
+        image_height,
+        tile_size=tile_size,
+        isect_offsets=isect_offsets,
+        flatten_ids=flatten_ids,
+        backgrounds=backgrounds,
+        return_last_ids=True,
+        return_sample_counts=True,
+        rays=rays,
+        use_hit_distance=use_hit_distance,
+        return_normals=return_normals,
     )
-
-    for image_id in range(c):
-        for tile_y in range(tile_height):
-            for tile_x in range(tile_width):
-                tile_id = tile_y * tile_width + tile_x
-                global_tile = image_id * tile_height * tile_width + tile_id
-                range_start = int(offsets_flat[global_tile].item())
-                range_end = (
-                    int(offsets_flat[global_tile + 1].item())
-                    if global_tile + 1 < c * tile_height * tile_width
-                    else n_isects
-                )
-                masked = masks is not None and not bool(masks[image_id, tile_y, tile_x].item())
-                for local_y in range(tile_size):
-                    for local_x in range(tile_size):
-                        py = tile_y * tile_size + local_y
-                        px = tile_x * tile_size + local_x
-                        if py >= image_height or px >= image_width:
-                            continue
-                        if masked:
-                            if backgrounds is not None:
-                                render_colors[image_id, py, px] = backgrounds[image_id]
-                            continue
-
-                        ray_o = rays[image_id, py, px, :3]
-                        ray_d = rays[image_id, py, px, 3:]
-                        T = torch.tensor(1.0, dtype=means.dtype)
-                        accum = torch.zeros(channels, dtype=means.dtype)
-                        normal_accum = torch.zeros(3, dtype=means.dtype)
-                        cur_idx = -1
-                        count = 0
-
-                        for idx in range(range_start, range_end):
-                            isect_id = int(flatten_ids[idx].item())
-                            gaussian_id = isect_id % n
-                            xyz = means[gaussian_id]
-                            quat = quats[gaussian_id]
-                            scale = scales[gaussian_id]
-                            R = _quat_to_rotmat(quat)
-                            Mt = torch.diag(1.0 / scale) @ R.transpose(0, 1)
-                            gro = Mt @ (ray_o - xyz)
-                            grd = _safe_normalize(Mt @ ray_d)
-                            gcrod = torch.cross(grd, gro, dim=0)
-                            gray_dist = torch.sum(gcrod * gcrod)
-                            power = -0.5 * gray_dist
-                            max_response = torch.exp(power)
-                            alpha = torch.minimum(
-                                torch.tensor(0.99, dtype=means.dtype),
-                                opacities[image_id, gaussian_id] * max_response,
-                            )
-                            if alpha.detach().item() < (1.0 / 255.0) or max_response.detach().item() <= 0.0113:
-                                continue
-
-                            next_T = T * (1.0 - alpha)
-                            if next_T.detach().item() <= 1.0e-4:
-                                break
-
-                            vis = alpha * T
-                            if use_hit_distance:
-                                hit_t = torch.sum(grd * (-gro))
-                                grds = scale * (grd * hit_t)
-                                hit_distance = torch.linalg.norm(grds)
-                                sample_value = colors[image_id, gaussian_id].clone()
-                                sample_value[-1] = hit_distance
-                            else:
-                                sample_value = colors[image_id, gaussian_id]
-
-                            accum = accum + sample_value * vis
-                            if return_normals:
-                                unnormalized_normal = R[:, 2]
-                                flipped = torch.sum(unnormalized_normal * ray_d) > 0
-                                normal = _safe_normalize(
-                                    -unnormalized_normal if flipped else unnormalized_normal
-                                )
-                                normal_accum = normal_accum + normal * vis
-                            T = next_T
-                            cur_idx = idx
-                            count += 1
-
-                        if backgrounds is not None:
-                            accum = accum + backgrounds[image_id] * T
-                        render_colors[image_id, py, px] = accum
-                        render_alphas[image_id, py, px, 0] = 1.0 - T
-                        last_ids[image_id, py, px] = cur_idx
-                        sample_counts[image_id, py, px] = count
-                        if render_normals is not None:
-                            render_normals[image_id, py, px] = normal_accum
-
-    return render_colors, render_alphas, last_ids, sample_counts, render_normals
 
 
 def test_rasterize_to_pixels_eval3d_forward_matches_reference():
@@ -322,6 +244,8 @@ def test_rasterize_to_pixels_eval3d_forward_matches_reference():
         scales,
         colors,
         opacities,
+        viewmats,
+        ks,
         rays,
         width,
         height,
@@ -382,6 +306,8 @@ def test_rasterize_to_pixels_eval3d_hit_distance_matches_reference():
         scales,
         colors,
         opacities,
+        viewmats,
+        ks,
         rays,
         width,
         height,
@@ -698,6 +624,8 @@ def test_rasterize_to_pixels_eval3d_backward_matches_reference():
         ref_scales,
         ref_colors,
         ref_opacities,
+        viewmats,
+        ks,
         ref_rays,
         width,
         height,
@@ -788,6 +716,8 @@ def test_rasterize_to_pixels_eval3d_implicit_pinhole_backward_matches_reference(
         ref_scales,
         ref_colors,
         ref_opacities,
+        viewmats,
+        ks,
         rays,
         width,
         height,

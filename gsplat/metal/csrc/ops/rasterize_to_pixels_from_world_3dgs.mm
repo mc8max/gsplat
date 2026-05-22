@@ -30,6 +30,8 @@ struct RasterizeFromWorldConfig {
     uint32_t n_tiles;
     uint32_t total_tiles;
     uint32_t n_isects;
+    uint32_t image_width;
+    uint32_t image_height;
 };
 
 RasterizeFromWorldConfig validate_common(
@@ -171,6 +173,8 @@ RasterizeFromWorldConfig validate_common(
     cfg.n_tiles = static_cast<uint32_t>(tile_width * tile_height);
     cfg.total_tiles = cfg.I * cfg.n_tiles;
     cfg.n_isects = static_cast<uint32_t>(flatten_ids.size(0));
+    cfg.image_width = static_cast<uint32_t>(image_width);
+    cfg.image_height = static_cast<uint32_t>(image_height);
     return cfg;
 }
 
