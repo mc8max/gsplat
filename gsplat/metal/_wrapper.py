@@ -2375,6 +2375,10 @@ def rasterize_to_pixels_eval3d(
         if viewmats_rs.shape != image_dims + (4, 4):
             raise ValueError(f"viewmats_rs must have shape {image_dims + (4, 4)}, got {viewmats_rs.shape}")
         viewmats_rs = viewmats_rs.contiguous()
+    if rays is not None and rolling_shutter != RollingShutterType.GLOBAL:
+        raise NotImplementedError(
+            "Metal rasterize_to_pixels_eval3d does not support rolling_shutter with explicit rays"
+        )
     if rolling_shutter != RollingShutterType.GLOBAL and viewmats_rs is None:
         raise ValueError("viewmats_rs is required when rolling_shutter is not GLOBAL")
 

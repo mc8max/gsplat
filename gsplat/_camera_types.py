@@ -5,8 +5,9 @@
 from __future__ import annotations
 
 from abc import ABC
+from dataclasses import dataclass
 from enum import IntEnum
-from typing import Any
+from typing import ClassVar, Sequence
 
 import torch
 from typing_extensions import Literal
@@ -20,36 +21,9 @@ ExternalDistortionModelMeta = Literal["bivariate-windshield"]
 CameraModel = Literal["pinhole", "ortho", "fisheye", "ftheta", "lidar"]
 
 
-def _unavailable_cuda_cls(name: str) -> Any:
-    class _UnavailableCudaCls:
-        __name__ = name
-
-        def __init__(self, *args: Any, **kwargs: Any) -> None:
-            raise RuntimeError(
-                "gsplat CUDA extension is not available (not built or failed to load). "
-                f"Cannot instantiate '{name}'."
-            )
-
-    return _UnavailableCudaCls
-
-
-def _make_lazy_cuda_cls(name: str) -> Any:
-    # pylint: disable=import-outside-toplevel
-    from gsplat.cuda._backend import _C
-
-    if _C is None:
-        return _unavailable_cuda_cls(name)
-
-    try:
-        return getattr(torch.classes.gsplat, name)
-    except RuntimeError as e:
-        if "does not exist" in str(e) or "torch::class_" in str(e):
-            return _unavailable_cuda_cls(name)
-        raise
-
-
 class RollingShutterType(IntEnum):
     ROLLING_TOP_TO_BOTTOM = 0
+    LINEAR = 0
     ROLLING_LEFT_TO_RIGHT = 1
     ROLLING_BOTTOM_TO_TOP = 2
     ROLLING_RIGHT_TO_LEFT = 3
@@ -61,10 +35,39 @@ class FThetaPolynomialType(IntEnum):
     ANGLE_TO_PIXELDIST = 1
 
 
-UnscentedTransformParameters = _make_lazy_cuda_cls("UnscentedTransformParameters")
-FThetaCameraDistortionParameters = _make_lazy_cuda_cls(
-    "FThetaCameraDistortionParameters"
-)
+@dataclass
+class UnscentedTransformParameters:
+    alpha: float = 0.1
+    beta: float = 2.0
+    kappa: float = 0.0
+
+    def __post_init__(self) -> None:
+        if self.alpha <= 0.0:
+            raise RuntimeError("alpha must be positive")
+        if 3.0 + self.kappa <= 0.0:
+            raise RuntimeError("alpha and kappa must satisfy D + kappa > 0 for D=3")
+
+
+@dataclass
+class FThetaCameraDistortionParameters:
+    reference_poly: FThetaPolynomialType
+    pixeldist_to_angle_poly: Sequence[float]
+    angle_to_pixeldist_poly: Sequence[float]
+    max_angle: float
+    linear_cde: Sequence[float]
+
+    def __post_init__(self) -> None:
+        self.pixeldist_to_angle_poly = tuple(self.pixeldist_to_angle_poly)
+        self.angle_to_pixeldist_poly = tuple(self.angle_to_pixeldist_poly)
+        self.linear_cde = tuple(self.linear_cde)
+        if len(self.pixeldist_to_angle_poly) != 6:
+            raise RuntimeError("pixeldist_to_angle_poly must have 6 coefficients")
+        if len(self.angle_to_pixeldist_poly) != 6:
+            raise RuntimeError("angle_to_pixeldist_poly must have 6 coefficients")
+        if len(self.linear_cde) != 3:
+            raise RuntimeError("linear_cde must have 3 coefficients")
+        if self.max_angle <= 0.0:
+            raise RuntimeError("max_angle must be positive")
 
 
 class ExternalDistortionModelParameters(ABC):
@@ -76,23 +79,20 @@ class ExternalDistortionReferencePolynomial(IntEnum):
     BACKWARD = 2
 
 
+@dataclass
 class BivariateWindshieldModelParameters(ExternalDistortionModelParameters):
-    """Thin wrapper around the CUDA BivariateWindshieldModelParameters class."""
+    """Backend-neutral external distortion parameters."""
 
-    _cuda_cls = None
-    MAX_ORDER: int = 5
-    MAX_COEFFS: int = 21
+    MAX_ORDER: ClassVar[int] = 5
+    MAX_COEFFS: ClassVar[int] = 21
 
-    @classmethod
-    def _ensure_cuda_cls(cls):
-        if cls._cuda_cls is None:
-            cls._cuda_cls = _make_lazy_cuda_cls("BivariateWindshieldModelParameters")
-            cls.MAX_ORDER = cls._cuda_cls.get_max_order()
-            cls.MAX_COEFFS = cls._cuda_cls.get_max_coeffs()
-
-    def __new__(cls):
-        cls._ensure_cuda_cls()
-        return cls._cuda_cls()
+    reference_poly: ExternalDistortionReferencePolynomial = (
+        ExternalDistortionReferencePolynomial.FORWARD
+    )
+    horizontal_poly: torch.Tensor | None = None
+    vertical_poly: torch.Tensor | None = None
+    horizontal_poly_inverse: torch.Tensor | None = None
+    vertical_poly_inverse: torch.Tensor | None = None
 
 
 class FOV(FOVBase):
@@ -100,37 +100,11 @@ class FOV(FOVBase):
     def from_base(cls, base: FOVBase) -> "FOV":
         return cls(start=base.start, span=base.span, direction=base.direction)
 
-    def to_cpp(self):
-        fov_cuda = _make_lazy_cuda_cls("FOV")
-        return fov_cuda(start=self.start, span=self.span)
-
 
 class RowOffsetStructuredSpinningLidarModelParametersExt(
     RowOffsetStructuredSpinningLidarModelParametersExtBase
 ):
     """Lidar camera parameters extended with acceleration structures."""
-
-    def to_cpp(self) -> Any:
-        lidar_params_cuda = _make_lazy_cuda_cls(
-            "RowOffsetStructuredSpinningLidarModelParametersExt"
-        )
-        return lidar_params_cuda(
-            row_elevations_rad=self.row_elevations_rad.contiguous(),
-            column_azimuths_rad=self.column_azimuths_rad.contiguous(),
-            row_azimuth_offsets_rad=self.row_azimuth_offsets_rad.contiguous(),
-            spinning_direction=self.spinning_direction.value,
-            spinning_frequency_hz=self.spinning_frequency_hz,
-            fov_vert_rad=FOV.from_base(self.fov_vert_rad).to_cpp(),
-            fov_horiz_rad=FOV.from_base(self.fov_horiz_rad).to_cpp(),
-            fov_eps_rad=self.fov_eps_rad,
-            angles_to_columns_map=self.angles_to_columns_map,
-            n_bins_azimuth=self.tiling.n_bins_azimuth,
-            n_bins_elevation=self.tiling.n_bins_elevation,
-            cdf_elevation=self.tiling.cdf_elevation.contiguous(),
-            cdf_dense_ray_mask=self.tiling.cdf_dense_ray_mask.contiguous(),
-            tiles_to_elements_map=self.tiling.tiles_to_elements_map.contiguous(),
-            tiles_pack_info=self.tiling.tiles_pack_info.contiguous(),
-        )
 
 
 __all__ = [

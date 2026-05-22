@@ -3,6 +3,8 @@
 
 """Public Python entry points for the gsplat Metal backend."""
 
+from gsplat._camera_types import RollingShutterType
+
 from ._backend import has_metal
 from ._wrapper import (
     distort_camera_rays,
@@ -47,5 +49,6 @@ __all__ = [
     "rasterize_to_pixels",
     "rasterize_to_pixels_eval3d",
     "rasterize_to_pixels_2dgs",
+    "RollingShutterType",
     "spherical_harmonics",
 ]

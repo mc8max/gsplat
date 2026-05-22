@@ -2,19 +2,23 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import math
+import sys
 
 import pytest
 import torch
 
 import gsplat.metal as gm
-from gsplat._camera_types import RollingShutterType
+from gsplat._camera_types import (
+    BivariateWindshieldModelParameters,
+    ExternalDistortionReferencePolynomial,
+    RollingShutterType,
+)
 from gsplat.cuda._torch_cameras import (
     _BaseCameraModel,
     _interpolate_shutter_pose,
     _pose_camera_ray_to_world_ray,
     _viewmat_to_pose,
 )
-from gsplat.cuda._torch_external_distortion import make_params
 from gsplat.metal._math import (
     _fully_fused_projection,
     _isect_offset_encode,
@@ -26,6 +30,105 @@ from gsplat.metal._math import (
 pytestmark = pytest.mark.skipif(
     not torch.backends.mps.is_available(), reason="MPS required"
 )
+
+
+def _pack_info_torch(ray_indices, n_rays=None):
+    assert ray_indices.dim() == 1, "ray_indices must be a 1D tensor with shape (n_samples)."
+    if n_rays is None:
+        n_rays = int(ray_indices.max().item()) + 1 if ray_indices.numel() > 0 else 0
+    counts = torch.bincount(ray_indices.to(torch.int64), minlength=n_rays)
+    starts = counts.cumsum(dim=0) - counts
+    return torch.stack([starts, counts], dim=-1)
+
+
+def _render_weight_from_alpha_torch(
+    alphas,
+    packed_info=None,
+    ray_indices=None,
+    n_rays=None,
+    prefix_trans=None,
+):
+    if packed_info is None:
+        if ray_indices is None:
+            raise ValueError("packed_info or ray_indices is required")
+        packed_info = _pack_info_torch(ray_indices, n_rays)
+
+    starts = packed_info[:, 0].to(torch.int64)
+    counts = packed_info[:, 1].to(torch.int64)
+    trans = torch.empty_like(alphas)
+    weights = torch.empty_like(alphas)
+    if prefix_trans is None:
+        prefix_vals = torch.ones((packed_info.shape[0],), device=alphas.device, dtype=alphas.dtype)
+    else:
+        prefix_vals = prefix_trans.reshape(-1).to(device=alphas.device, dtype=alphas.dtype)
+
+    for ray_idx in range(packed_info.shape[0]):
+        count = int(counts[ray_idx].item())
+        if count == 0:
+            continue
+        start = int(starts[ray_idx].item())
+        alpha_chunk = alphas[start : start + count]
+        trans_chunk = torch.cumprod(
+            torch.cat(
+                [
+                    prefix_vals[ray_idx : ray_idx + 1],
+                    1.0 - alpha_chunk[:-1],
+                ]
+            ),
+            dim=0,
+        )
+        trans[start : start + count] = trans_chunk
+        weights[start : start + count] = alpha_chunk * trans_chunk
+
+    return weights, trans
+
+
+def _accumulate_along_rays_torch(weights, values=None, ray_indices=None, n_rays=None):
+    if ray_indices is None or n_rays is None:
+        raise ValueError("ray_indices and n_rays are required")
+    ray_indices = ray_indices.to(torch.int64)
+    if values is None:
+        out = torch.zeros((n_rays, 1), device=weights.device, dtype=weights.dtype)
+        out.index_add_(0, ray_indices, weights[:, None])
+        return out
+    out = torch.zeros((n_rays, values.shape[-1]), device=values.device, dtype=values.dtype)
+    out.index_add_(0, ray_indices, weights[:, None] * values)
+    return out
+
+
+def _ensure_nerfacc_reference_fallbacks():
+    nerfacc = pytest.importorskip("nerfacc", reason="eval3d torch reference requires nerfacc")
+    if torch.cuda.is_available():
+        return
+    nerfacc.pack_info = _pack_info_torch
+    nerfacc.render_weight_from_alpha = _render_weight_from_alpha_torch
+    nerfacc.accumulate_along_rays = _accumulate_along_rays_torch
+    sys.modules["nerfacc"].pack_info = _pack_info_torch
+    sys.modules["nerfacc"].render_weight_from_alpha = _render_weight_from_alpha_torch
+    sys.modules["nerfacc"].accumulate_along_rays = _accumulate_along_rays_torch
+
+
+def _make_external_distortion_params(
+    h_poly,
+    v_poly,
+    h_inv=None,
+    v_inv=None,
+    ref_poly=ExternalDistortionReferencePolynomial.FORWARD,
+    device=None,
+):
+    if device is None:
+        device = torch.device("cpu")
+    if h_inv is None:
+        h_inv = [0.0, 1.0, 0.0]
+    if v_inv is None:
+        v_inv = [0.0, 0.0, 1.0]
+    params = BivariateWindshieldModelParameters()
+    params.reference_poly = ref_poly
+    params.horizontal_poly = torch.tensor(h_poly, dtype=torch.float32, device=device)
+    params.vertical_poly = torch.tensor(v_poly, dtype=torch.float32, device=device)
+    params.horizontal_poly_inverse = torch.tensor(h_inv, dtype=torch.float32, device=device)
+    params.vertical_poly_inverse = torch.tensor(v_inv, dtype=torch.float32, device=device)
+    return params
 
 
 def _sample_inputs(width=24, height=16, tile_size=8, c=2, n=6, channels=5):
@@ -198,7 +301,7 @@ def _reference_eval3d(
     use_hit_distance=False,
     return_normals=False,
 ):
-    pytest.importorskip("nerfacc", reason="eval3d torch reference requires nerfacc")
+    _ensure_nerfacc_reference_fallbacks()
     return _rasterize_to_pixels_eval3d(
         means,
         quats,
@@ -530,7 +633,7 @@ def test_rasterize_to_pixels_eval3d_fisheye_and_external_distortion_match_explic
         [[0.01, -0.002, 0.0005, -0.0001], [-0.008, 0.001, -0.0003, 0.00005]],
         dtype=torch.float32,
     )
-    ext = make_params(
+    ext = _make_external_distortion_params(
         h_poly=[0.0, 1.0, 0.02],
         v_poly=[0.0, -0.01, 1.0],
         device=torch.device("mps"),
