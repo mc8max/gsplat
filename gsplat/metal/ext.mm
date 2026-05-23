@@ -7,6 +7,7 @@
 #include "ops/external_distortion.h"
 #include "ops/intersect_offset.h"
 #include "ops/intersect_tile.h"
+#include "ops/intersect_tile_lidar.h"
 #include "ops/null.h"
 #include "ops/projection_ewa_3dgs_packed.h"
 #include "ops/projection_ewa_3dgs_fused.h"
@@ -152,6 +153,15 @@ TORCH_LIBRARY_FRAGMENT(gsplat, m) {
         "int tile_height, bool sort, bool packed, bool segmented"
         ") -> (Tensor, Tensor, Tensor)");
     m.def(
+        "metal_intersect_tile_lidar("
+        "Tensor means2d, Tensor radii, Tensor depths, Tensor? image_ids, Tensor? gaussian_ids, "
+        "int I, bool sort, bool segmented, bool packed, int n_bins_azimuth, int n_bins_elevation, "
+        "int cdf_resolution_azimuth, int cdf_resolution_elevation, float angle_to_pixel_scaling_factor, "
+        "float fov_horiz_start, float fov_horiz_span, float fov_vert_start, float fov_vert_span, "
+        "float fov_eps, int spinning_direction, Tensor cdf_elevation, "
+        "Tensor cdf_dense_ray_mask, Tensor tiles_pack_info, Tensor tiles_to_elements_map"
+        ") -> (Tensor, Tensor, Tensor)");
+    m.def(
         "metal_rasterize_to_pixels_2dgs_fwd("
         "Tensor means2d, Tensor ray_transforms, Tensor colors, Tensor opacities, "
         "Tensor normals, Tensor? backgrounds, Tensor? masks, int image_width, int image_height, "
@@ -215,6 +225,7 @@ TORCH_LIBRARY_IMPL(gsplat, MPS, m) {
     m.impl("metal_intersect_tile_count", &intersect_tile_count_op);
     m.impl("metal_intersect_tile_emit", &intersect_tile_emit_op);
     m.impl("metal_intersect_tile", &intersect_tile_op);
+    m.impl("metal_intersect_tile_lidar", &intersect_tile_lidar_op);
     m.impl("metal_projection_ewa_3dgs_packed_fwd", &projection_ewa_3dgs_packed_fwd_op);
     m.impl("metal_projection_ewa_3dgs_packed_bwd", &projection_ewa_3dgs_packed_bwd_op);
     m.impl("metal_projection_2dgs_fused_fwd", &projection_2dgs_fused_fwd_op);

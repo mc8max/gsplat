@@ -40,12 +40,16 @@ class UnscentedTransformParameters:
     alpha: float = 0.1
     beta: float = 2.0
     kappa: float = 0.0
+    in_image_margin_factor: float = 0.1
+    require_all_sigma_points_valid: bool = False
 
     def __post_init__(self) -> None:
         if self.alpha <= 0.0:
             raise RuntimeError("alpha must be positive")
         if 3.0 + self.kappa <= 0.0:
             raise RuntimeError("alpha and kappa must satisfy D + kappa > 0 for D=3")
+        if self.in_image_margin_factor < 0.0:
+            raise RuntimeError("in_image_margin_factor must be non-negative")
 
 
 @dataclass

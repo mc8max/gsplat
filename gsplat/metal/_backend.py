@@ -9,6 +9,7 @@ import os
 import sys
 import threading
 import warnings
+import importlib
 
 import torch
 
@@ -34,8 +35,9 @@ def load() -> bool:
             return False
 
         try:
-            from gsplat import metal_ext as _C
-        except ImportError:
+            _C = importlib.import_module("gsplat.metal_ext")
+        except ImportError as e:
+            warnings.warn(f"Unable to import gsplat.metal_ext: {e}")
             return False
 
         metallib = os.path.join(os.path.dirname(__file__), "gsplat_metal.metallib")

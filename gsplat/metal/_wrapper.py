@@ -28,6 +28,26 @@ class _IntersectTileInputs:
     I: int
     n_elements: int
 
+
+@dataclass(frozen=True)
+class _LidarTilePayload:
+    n_bins_azimuth: int
+    n_bins_elevation: int
+    cdf_resolution_azimuth: int
+    cdf_resolution_elevation: int
+    angle_to_pixel_scaling_factor: float
+    fov_horiz_start: float
+    fov_horiz_span: float
+    fov_vert_start: float
+    fov_vert_span: float
+    fov_eps: float
+    spinning_direction: int
+    cdf_elevation: torch.Tensor
+    cdf_dense_ray_mask: torch.Tensor
+    tiles_pack_info: torch.Tensor
+    tiles_to_elements_map: torch.Tensor
+
+
 def _make_lazy_metal_func(name: str):
     """Return a callable that loads the Metal extension on first use."""
 
@@ -310,6 +330,203 @@ def _prepare_intersect_tile_inputs(
     return _IntersectTileInputs(
         I=I,
         n_elements=n_elements,
+    )
+
+
+def _prepare_intersect_tile_lidar_inputs(
+    lidar: RowOffsetStructuredSpinningLidarModelParametersExt,
+    means2d: torch.Tensor,
+    radii: torch.Tensor,
+    depths: torch.Tensor,
+    *,
+    packed: bool,
+    n_images: Optional[int],
+    image_ids: Optional[torch.Tensor],
+    gaussian_ids: Optional[torch.Tensor],
+) -> _IntersectTileInputs:
+    if means2d.device.type != "mps":
+        raise ValueError(f"means2d must be on MPS, got {means2d.device}")
+    if radii.device != means2d.device or depths.device != means2d.device:
+        raise ValueError("means2d, radii, and depths must be on the same device")
+    if means2d.dtype != torch.float32:
+        raise ValueError(
+            f"Metal intersect_tiles_lidar currently requires float32 means2d, got {means2d.dtype}"
+        )
+    if depths.dtype != torch.float32:
+        raise ValueError(
+            f"Metal intersect_tiles_lidar currently requires float32 depths, got {depths.dtype}"
+        )
+    if radii.dtype != torch.int32:
+        raise ValueError(
+            f"Metal intersect_tiles_lidar currently requires int32 radii, got {radii.dtype}"
+        )
+
+    if packed:
+        nnz = means2d.size(0)
+        if means2d.shape != (nnz, 2):
+            raise ValueError(f"packed means2d must have shape (nnz, 2), got {means2d.shape}")
+        if radii.shape != (nnz, 2):
+            raise ValueError(f"packed radii must have shape (nnz, 2), got {radii.shape}")
+        if depths.shape != (nnz,):
+            raise ValueError(f"packed depths must have shape (nnz,), got {depths.shape}")
+        if image_ids is None or gaussian_ids is None or n_images is None:
+            raise ValueError(
+                "image_ids, gaussian_ids, and n_images are required when packed=True"
+            )
+        if image_ids.device != means2d.device or gaussian_ids.device != means2d.device:
+            raise ValueError("image_ids and gaussian_ids must be on the same device as means2d")
+        if image_ids.dtype != torch.int64:
+            raise ValueError(f"image_ids must be int64, got {image_ids.dtype}")
+        if gaussian_ids.dtype != torch.int64:
+            raise ValueError(f"gaussian_ids must be int64, got {gaussian_ids.dtype}")
+        if image_ids.shape != (nnz,):
+            raise ValueError(f"packed image_ids must have shape (nnz,), got {image_ids.shape}")
+        if gaussian_ids.shape != (nnz,):
+            raise ValueError(
+                f"packed gaussian_ids must have shape (nnz,), got {gaussian_ids.shape}"
+            )
+        if n_images < 0:
+            raise ValueError(f"n_images must be non-negative, got {n_images}")
+        I = n_images
+        n_elements = nnz
+    else:
+        image_dims = means2d.shape[:-2]
+        N = means2d.shape[-2]
+        if radii.shape != image_dims + (N, 2):
+            raise ValueError(f"radii must have shape {image_dims + (N, 2)}, got {radii.shape}")
+        if depths.shape != image_dims + (N,):
+            raise ValueError(f"depths must have shape {image_dims + (N,)}, got {depths.shape}")
+        if image_ids is not None or gaussian_ids is not None:
+            raise ValueError("image_ids and gaussian_ids must be omitted when packed=False")
+        I = math.prod(image_dims)
+        n_elements = I * N
+
+    return _IntersectTileInputs(I=I, n_elements=n_elements)
+
+
+def _pack_lidar_tile_payload(
+    lidar: RowOffsetStructuredSpinningLidarModelParametersExt,
+    device: torch.device,
+) -> _LidarTilePayload:
+    from gsplat.cuda._torch_impl_lidar import ANGLE_TO_PIXEL_SCALING_FACTOR
+
+    tiling = lidar.tiling
+
+    if tiling.cdf_elevation.dtype != torch.int32 or tiling.cdf_elevation.ndim != 1:
+        raise ValueError("lidar.tiling.cdf_elevation must be int32 with shape (R+1,)")
+    if tiling.cdf_dense_ray_mask.dtype != torch.int32 or tiling.cdf_dense_ray_mask.ndim != 2:
+        raise ValueError(
+            "lidar.tiling.cdf_dense_ray_mask must be int32 with shape (Re+1, Ra+1)"
+        )
+    if tiling.tiles_pack_info.dtype != torch.int32 or tiling.tiles_pack_info.ndim != 2:
+        raise ValueError(
+            "lidar.tiling.tiles_pack_info must be int32 with shape (n_tiles, 2)"
+        )
+    if tiling.tiles_to_elements_map.dtype != torch.int32 or tiling.tiles_to_elements_map.ndim != 2:
+        raise ValueError(
+            "lidar.tiling.tiles_to_elements_map must be int32 with shape (n_rays, 2)"
+        )
+    if tiling.tiles_pack_info.shape[1] != 2:
+        raise ValueError(
+            "lidar.tiling.tiles_pack_info must have shape (n_tiles, 2), got "
+            f"{tuple(tiling.tiles_pack_info.shape)}"
+        )
+    if tiling.tiles_to_elements_map.shape[1] != 2:
+        raise ValueError(
+            "lidar.tiling.tiles_to_elements_map must have shape (n_rays, 2), got "
+            f"{tuple(tiling.tiles_to_elements_map.shape)}"
+        )
+
+    cdf_elevation = tiling.cdf_elevation.to(device=device).contiguous()
+    cdf_dense_ray_mask = tiling.cdf_dense_ray_mask.to(device=device).contiguous()
+    tiles_pack_info = tiling.tiles_pack_info.to(device=device).contiguous()
+    tiles_to_elements_map = tiling.tiles_to_elements_map.to(device=device).contiguous()
+
+    expected_tiles = tiling.n_bins_azimuth * tiling.n_bins_elevation
+    if tiles_pack_info.shape != (expected_tiles, 2):
+        raise ValueError(
+            "lidar.tiling.tiles_pack_info must have shape "
+            f"({expected_tiles}, 2), got {tuple(tiles_pack_info.shape)}"
+        )
+    if cdf_elevation[-1].item() != tiling.n_bins_elevation:
+        raise ValueError(
+            "lidar.tiling.cdf_elevation[-1] must equal n_bins_elevation, got "
+            f"{cdf_elevation[-1].item()} and {tiling.n_bins_elevation}"
+        )
+
+    return _LidarTilePayload(
+        n_bins_azimuth=tiling.n_bins_azimuth,
+        n_bins_elevation=tiling.n_bins_elevation,
+        cdf_resolution_azimuth=tiling.cdf_resolution_azimuth,
+        cdf_resolution_elevation=tiling.cdf_resolution_elevation,
+        angle_to_pixel_scaling_factor=float(ANGLE_TO_PIXEL_SCALING_FACTOR),
+        fov_horiz_start=float(lidar.fov_horiz_rad.start),
+        fov_horiz_span=float(lidar.fov_horiz_rad.span),
+        fov_vert_start=float(lidar.fov_vert_rad.start),
+        fov_vert_span=float(lidar.fov_vert_rad.span),
+        fov_eps=float(lidar.fov_eps_rad),
+        spinning_direction=int(lidar.spinning_direction.value),
+        cdf_elevation=cdf_elevation,
+        cdf_dense_ray_mask=cdf_dense_ray_mask,
+        tiles_pack_info=tiles_pack_info,
+        tiles_to_elements_map=tiles_to_elements_map,
+    )
+
+
+def intersect_tiles_lidar(
+    lidar: RowOffsetStructuredSpinningLidarModelParametersExt,
+    means2d: torch.Tensor,
+    radii: torch.Tensor,
+    depths: torch.Tensor,
+    sort: bool = True,
+    segmented: bool = False,
+    packed: bool = False,
+    n_images: Optional[int] = None,
+    image_ids: Optional[torch.Tensor] = None,
+    gaussian_ids: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Map projected lidar Gaussians to intersecting tiles on MPS.
+
+    Phase 1 provides the Metal API surface and explicit lidar-state packing.
+    Native count/emit kernels land in later phases.
+    """
+
+    inputs = _prepare_intersect_tile_lidar_inputs(
+        lidar,
+        means2d,
+        radii,
+        depths,
+        packed=packed,
+        n_images=n_images,
+        image_ids=image_ids,
+        gaussian_ids=gaussian_ids,
+    )
+    payload = _pack_lidar_tile_payload(lidar, means2d.device)
+    return _make_lazy_metal_func("metal_intersect_tile_lidar")(
+        means2d.contiguous(),
+        radii.contiguous(),
+        depths.contiguous(),
+        image_ids.contiguous() if image_ids is not None else None,
+        gaussian_ids.contiguous() if gaussian_ids is not None else None,
+        inputs.I,
+        sort,
+        segmented,
+        packed,
+        payload.n_bins_azimuth,
+        payload.n_bins_elevation,
+        payload.cdf_resolution_azimuth,
+        payload.cdf_resolution_elevation,
+        payload.angle_to_pixel_scaling_factor,
+        payload.fov_horiz_start,
+        payload.fov_horiz_span,
+        payload.fov_vert_start,
+        payload.fov_vert_span,
+        payload.fov_eps,
+        payload.spinning_direction,
+        payload.cdf_elevation,
+        payload.cdf_dense_ray_mask,
+        payload.tiles_pack_info,
+        payload.tiles_to_elements_map,
     )
 
 def intersect_tile_count(
