@@ -198,6 +198,54 @@ def test_rasterize_to_indices_2dgs_partial_range_matches_reference():
     assert torch.equal(actual[2].cpu(), expected[2])
 
 
+def test_rasterize_to_indices_2dgs_empty_intersections_returns_empty_outputs():
+    image_width = 6
+    image_height = 4
+    tile_size = 2
+    means2d = torch.zeros(1, 0, 2, dtype=torch.float32, device="mps")
+    ray_transforms = torch.zeros(1, 0, 3, 3, dtype=torch.float32, device="mps")
+    opacities = torch.zeros(1, 0, dtype=torch.float32, device="mps")
+    transmittances = torch.ones(1, image_height, image_width, dtype=torch.float32, device="mps")
+    isect_offsets = torch.zeros(1, 2, 3, dtype=torch.int32, device="mps")
+    flatten_ids = torch.empty(0, dtype=torch.int32, device="mps")
+
+    gaussian_ids, pixel_ids, image_ids = gm.rasterize_to_indices_in_range_2dgs(
+        0,
+        8,
+        transmittances,
+        means2d,
+        ray_transforms,
+        opacities,
+        image_width,
+        image_height,
+        tile_size,
+        isect_offsets,
+        flatten_ids,
+    )
+
+    assert gaussian_ids.dtype == torch.int64
+    assert pixel_ids.dtype == torch.int64
+    assert image_ids.dtype == torch.int64
+    assert gaussian_ids.numel() == 0
+    assert pixel_ids.numel() == 0
+    assert image_ids.numel() == 0
+
+
+def test_rasterize_to_indices_2dgs_large_smoke_matches_reference():
+    inputs = _prepare_projected_inputs(width=48, height=32, tile_size=4)
+    expected = _reference_rasterize_to_indices_2dgs(1, 3, *inputs)
+
+    actual = gm.rasterize_to_indices_in_range_2dgs(
+        1,
+        3,
+        *[arg.to("mps") if isinstance(arg, torch.Tensor) else arg for arg in inputs],
+    )
+
+    assert torch.equal(actual[0].cpu(), expected[0])
+    assert torch.equal(actual[1].cpu(), expected[1])
+    assert torch.equal(actual[2].cpu(), expected[2])
+
+
 def test_rasterize_to_indices_2dgs_accepts_native_projection_outputs():
     width = 36
     height = 24
@@ -249,3 +297,68 @@ def test_rasterize_to_indices_2dgs_accepts_native_projection_outputs():
     assert pixel_ids.dtype == torch.int64
     assert image_ids.dtype == torch.int64
     assert gaussian_ids.shape == pixel_ids.shape == image_ids.shape
+
+
+def test_rasterize_to_indices_2dgs_pipeline_matches_reference():
+    width = 40
+    height = 28
+    tile_size = 8
+    means, quats, scales, viewmats, Ks, opacities = _sample_world_inputs(
+        width=width, height=height
+    )
+
+    radii, means2d, depths, ray_transforms, _normals = gm.fully_fused_projection_2dgs(
+        means.to("mps"),
+        quats.to("mps"),
+        scales.to("mps"),
+        viewmats.to("mps"),
+        Ks.to("mps"),
+        width,
+        height,
+    )
+    _tiles_per_gauss, isect_ids, flatten_ids = gm.intersect_tiles(
+        means2d,
+        radii,
+        depths,
+        tile_size,
+        math.ceil(width / tile_size),
+        math.ceil(height / tile_size),
+    )
+    isect_offsets = gm.intersect_offset_encode(
+        isect_ids.contiguous(),
+        means2d.shape[0],
+        math.ceil(width / tile_size),
+        math.ceil(height / tile_size),
+    )
+    transmittances = torch.ones(means2d.shape[0], height, width, device="mps", dtype=torch.float32)
+
+    expected = _reference_rasterize_to_indices_2dgs(
+        0,
+        1_000_000,
+        transmittances.cpu(),
+        means2d.cpu(),
+        ray_transforms.cpu(),
+        opacities.cpu(),
+        width,
+        height,
+        tile_size,
+        isect_offsets.cpu(),
+        flatten_ids.cpu(),
+    )
+    actual = gm.rasterize_to_indices_in_range_2dgs(
+        0,
+        1_000_000,
+        transmittances,
+        means2d,
+        ray_transforms,
+        opacities.to("mps"),
+        width,
+        height,
+        tile_size,
+        isect_offsets,
+        flatten_ids,
+    )
+
+    assert torch.equal(actual[0].cpu(), expected[0])
+    assert torch.equal(actual[1].cpu(), expected[1])
+    assert torch.equal(actual[2].cpu(), expected[2])

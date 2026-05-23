@@ -227,6 +227,21 @@ def test_segmented_sort_false_matches_unsorted_emit(mps_device):
     _assert_equal(actual, expected)
 
 
+def test_intersect_tiles_lidar_empty_inputs_return_empty_outputs(mps_device):
+    lidar = _make_test_lidar(mps_device)
+    means2d = torch.empty((1, 0, 2), dtype=torch.float32, device=mps_device)
+    radii = torch.empty((1, 0, 2), dtype=torch.int32, device=mps_device)
+    depths = torch.empty((1, 0), dtype=torch.float32, device=mps_device)
+
+    tiles_per_gauss, isect_ids, flatten_ids = gm.intersect_tiles_lidar(
+        lidar, means2d, radii, depths, sort=True
+    )
+
+    assert tiles_per_gauss.shape == (1, 0)
+    assert isect_ids.numel() == 0
+    assert flatten_ids.numel() == 0
+
+
 def test_intersect_tiles_lidar_offset_chain_matches_reference(mps_device):
     lidar = _make_test_lidar(mps_device)
     means2d = torch.tensor(
@@ -259,3 +274,26 @@ def test_intersect_tiles_lidar_offset_chain_matches_reference(mps_device):
         lidar.tiling.n_bins_elevation,
     )
     _assert_equal(actual_offsets, expected_offsets)
+
+
+def test_intersect_tiles_lidar_large_smoke_matches_reference(mps_device):
+    lidar = _make_test_lidar(mps_device)
+    torch.manual_seed(5)
+    n_images = 3
+    n_gaussians = 24
+    means2d = (
+        torch.rand(n_images, n_gaussians, 2, dtype=torch.float32, device=mps_device) * 1.2 - 0.6
+    ) * ANGLE_TO_PIXEL_SCALING_FACTOR
+    radii = torch.randint(
+        low=12,
+        high=200,
+        size=(n_images, n_gaussians, 2),
+        dtype=torch.int32,
+        device=mps_device,
+    )
+    depths = torch.rand(n_images, n_gaussians, dtype=torch.float32, device=mps_device) * 0.8 + 0.05
+
+    actual = gm.intersect_tiles_lidar(lidar, means2d, radii, depths, sort=True)
+    expected = _reference_isect_tiles_lidar(means2d, radii, depths, sort=True)
+
+    _assert_equal(actual, expected)

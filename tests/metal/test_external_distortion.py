@@ -184,6 +184,25 @@ def test_eval_bivariate_poly_2d_input(mps_device):
     _assert_eval_close(actual.cpu().flatten(), expected, atol=1e-4, rtol=1e-4)
 
 
+def test_eval_bivariate_poly_supports_noncontiguous_inputs(mps_device):
+    order = 2
+    coeffs = torch.tensor([1.0, 0.5, -0.25, 0.1, 0.0, 0.2], dtype=torch.float32, device=mps_device)
+    base = torch.tensor(
+        [[0.2, 9.0], [-0.4, 8.0], [0.6, 7.0], [0.8, 6.0]],
+        dtype=torch.float32,
+        device=mps_device,
+    )
+    x = base[:, 0]
+    y = base.flip(0)[:, 0]
+
+    assert not x.is_contiguous()
+    assert not y.is_contiguous()
+
+    actual = gm.eval_bivariate_poly(x, y, coeffs, order)
+    expected = _eval_reference(coeffs.cpu(), order, x.cpu(), y.cpu())
+    _assert_eval_close(actual, expected, atol=1e-4, rtol=1e-4)
+
+
 @pytest.mark.parametrize("n", [1_000, 10_000])
 def test_eval_bivariate_poly_large(mps_device, n):
     torch.manual_seed(0)
@@ -551,6 +570,47 @@ def test_distort_camera_rays_batch_consistency(mps_device):
     )
     for i in range(10):
         _assert_ray_close(result_single[0], result_batch[i], atol=1e-7, rtol=1e-7)
+
+
+def test_distort_camera_rays_supports_noncontiguous_inputs(mps_device):
+    h = make_identity_horizontal_poly()
+    v = make_identity_vertical_poly()
+    rays_base = torch.tensor(
+        [
+            [0.1, 9.0, 1.0, 8.0],
+            [-0.2, 7.0, 0.9, 6.0],
+            [0.3, 5.0, 0.8, 4.0],
+        ],
+        dtype=torch.float32,
+        device=mps_device,
+    )
+    rays = torch.stack([rays_base[:, 0], rays_base[:, 2], torch.ones(3, device=mps_device)], dim=-1)
+    h_t = torch.tensor(
+        [[h[0], 9.0], [h[1], 8.0], [h[2], 7.0]],
+        dtype=torch.float32,
+        device=mps_device,
+    )[:, 0]
+    v_t = torch.tensor(
+        [[v[0], 9.0], [v[1], 8.0], [v[2], 7.0]],
+        dtype=torch.float32,
+        device=mps_device,
+    )[:, 0]
+    zeros = torch.zeros_like(h_t)
+
+    assert not h_t.is_contiguous()
+    assert not v_t.is_contiguous()
+
+    actual = gm.distort_camera_rays(
+        rays,
+        h_t,
+        v_t,
+        zeros,
+        zeros,
+        int(ExternalDistortionReferencePolynomial.FORWARD),
+        False,
+    )
+    expected = _distort_reference(rays.cpu(), h, v)
+    _assert_ray_close(actual, expected, atol=1e-4, rtol=1e-4)
 
 
 def test_distort_camera_rays_boundary_rays_asin_clamp(mps_device):

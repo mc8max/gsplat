@@ -575,3 +575,35 @@ def test_projection_ut_3dgs_fused_rejects_unsupported_features(mps_device):
             camera_model="fisheye",
             tangential_coeffs=torch.zeros((1, 1, 2), dtype=torch.float32, device=mps_device),
         )
+
+
+def test_projection_ut_3dgs_fused_is_forward_only_for_autograd(mps_device):
+    width, height = 48, 36
+    means, quats, scales, opacities, viewmats, Ks = _sample_inputs(
+        batch_dims=(), cameras=2, gaussians=6, width=width, height=height
+    )
+
+    means_mps = means.to(mps_device).requires_grad_(True)
+    quats_mps = quats.to(mps_device).requires_grad_(True)
+    scales_mps = scales.to(mps_device).requires_grad_(True)
+    opacities_mps = opacities.to(mps_device).requires_grad_(True)
+    outputs = gm.fully_fused_projection_with_ut(
+        means_mps,
+        quats_mps,
+        scales_mps,
+        opacities_mps,
+        viewmats.to(mps_device),
+        Ks.to(mps_device),
+        width,
+        height,
+        calc_compensations=True,
+        camera_model="pinhole",
+    )
+    loss = sum(
+        (out * torch.randn_like(out)).sum()
+        for out in outputs
+        if out is not None and out.is_floating_point()
+    )
+
+    with pytest.raises(RuntimeError):
+        torch.autograd.grad(loss, (means_mps, quats_mps, scales_mps, opacities_mps))
