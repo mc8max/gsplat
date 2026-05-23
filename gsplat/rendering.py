@@ -24,7 +24,7 @@ from torch import Tensor
 from typing_extensions import Literal
 from ._helper import assert_shape
 
-from .cuda._wrapper import (
+from ._dispatch import (
     RollingShutterType,
     CameraModel,
     FThetaCameraDistortionParameters,
@@ -2163,7 +2163,7 @@ def rasterization_2dgs(
         image_ids = None
 
     densify = torch.zeros_like(
-        means2d, dtype=means.dtype, requires_grad=True, device="cuda"
+        means2d, dtype=means.dtype, requires_grad=True, device=means.device
     )
     # Identify intersecting tiles
     tile_width = math.ceil(width / float(tile_size))
@@ -2183,19 +2183,19 @@ def rasterization_2dgs(
     isect_offsets = isect_offset_encode(isect_ids, I, tile_width, tile_height)
     isect_offsets = isect_offsets.reshape(batch_dims + (C, tile_height, tile_width))
 
-    # TODO: SH also suport N-D.
-    # Compute the per-view colors
-    # if not (
-    #     colors.dim() == num_batch_dims + 3 and sh_degree is None
-    # ):  # silently support [..., C, N, D] color.
-    #     colors = (
-    #         colors.view(B, N, -1)[batch_ids, gaussian_ids]
-    #         if packed
-    #         else colors[..., None, :, :].expand((-1,) * num_batch_dims + (C, -1, -1))
-    #     )  # [nnz, D] or [..., C, N, 3]
-    # else:
-    #     if packed:
-    #         colors = colors.view(B, C, N, -1)[batch_ids, camera_ids, gaussian_ids, :]
+    # Compute the per-view colors.
+    if sh_degree is None:
+        if colors.dim() == num_batch_dims + 2:
+            colors = (
+                colors.view(B, N, -1)[batch_ids, gaussian_ids]
+                if packed
+                else colors[..., None, :, :].expand(
+                    (-1,) * num_batch_dims + (C, -1, -1)
+                )
+            )
+        elif packed:
+            colors = colors.view(B, C, N, -1)[batch_ids, camera_ids, gaussian_ids, :]
+
     if sh_degree is not None:  # SH coefficients
         camtoworlds = torch.inverse(viewmats)
         if packed:

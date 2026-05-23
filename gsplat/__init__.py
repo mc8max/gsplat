@@ -20,7 +20,7 @@ from .color_correct import color_correct_affine, color_correct_quadratic
 from .compression import PngCompression
 from .cuda._torch_impl import accumulate
 from .cuda._torch_impl_2dgs import accumulate_2dgs
-from .cuda._wrapper import (
+from ._dispatch import (
     CameraModel,
     ExternalDistortionModelMeta,
     ExternalDistortionModelParameters,
