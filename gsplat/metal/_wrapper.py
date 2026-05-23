@@ -1837,6 +1837,10 @@ def fully_fused_projection_with_ut(
 ):
     """Project world-space 3DGS Gaussians with UT support on MPS."""
 
+    # CUDA exposes projection_ut_3dgs_fused as a forward-only op as well.
+    # There is no standalone *_bwd op to mirror here; gradient support for the
+    # UT path in CUDA comes through rasterize_to_pixels_from_world_3dgs_*.
+
     if ut_params is None:
         ut_params = UnscentedTransformParameters()
 
