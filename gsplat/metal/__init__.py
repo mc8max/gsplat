@@ -26,6 +26,7 @@ from ._wrapper import (
     rasterize_to_pixels,
     rasterize_to_pixels_eval3d,
     rasterize_to_pixels_2dgs,
+    relocation,
     spherical_harmonics,
 )
 
@@ -55,6 +56,7 @@ __all__ = [
     "rasterize_to_pixels",
     "rasterize_to_pixels_eval3d",
     "rasterize_to_pixels_2dgs",
+    "relocation",
     "RollingShutterType",
     "spherical_harmonics",
 ]

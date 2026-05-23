@@ -140,6 +140,57 @@ def adam(
         exp_avg_sq.copy_(exp_avg_sq_arg)
 
 
+def relocation(
+    opacities: torch.Tensor,
+    scales: torch.Tensor,
+    ratios: torch.Tensor,
+    binoms: torch.Tensor,
+    n_max: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute relocated opacity/scale values on MPS."""
+
+    if opacities.device.type != "mps":
+        raise ValueError(f"opacities must be on MPS, got {opacities.device}")
+    if opacities.dtype != torch.float32:
+        raise ValueError(f"opacities must be float32, got {opacities.dtype}")
+    if opacities.dim() != 1:
+        raise ValueError(f"opacities must have shape [N], got {tuple(opacities.shape)}")
+    n = opacities.shape[0]
+
+    if scales.device != opacities.device:
+        raise ValueError(f"scales must be on the same device as opacities, got {scales.device} and {opacities.device}")
+    if scales.dtype != torch.float32:
+        raise ValueError(f"scales must be float32, got {scales.dtype}")
+    if tuple(scales.shape) != (n, 3):
+        raise ValueError(f"scales must have shape {(n, 3)}, got {tuple(scales.shape)}")
+
+    if ratios.device != opacities.device:
+        raise ValueError(f"ratios must be on the same device as opacities, got {ratios.device} and {opacities.device}")
+    if ratios.dtype != torch.int32:
+        raise ValueError(f"ratios must be int32, got {ratios.dtype}")
+    if tuple(ratios.shape) != (n,):
+        raise ValueError(f"ratios must have shape {(n,)}, got {tuple(ratios.shape)}")
+
+    if binoms.device != opacities.device:
+        raise ValueError(f"binoms must be on the same device as opacities, got {binoms.device} and {opacities.device}")
+    if binoms.dtype != torch.float32:
+        raise ValueError(f"binoms must be float32, got {binoms.dtype}")
+    if binoms.dim() != 2:
+        raise ValueError(f"binoms must be rank 2, got {binoms.dim()}")
+    if n_max < 0:
+        raise ValueError(f"n_max must be non-negative, got {n_max}")
+    if tuple(binoms.shape) != (n_max, n_max):
+        raise ValueError(f"binoms must have shape {(n_max, n_max)}, got {tuple(binoms.shape)}")
+
+    return _make_lazy_metal_func("metal_relocation")(
+        opacities.contiguous(),
+        scales.contiguous(),
+        ratios.contiguous(),
+        binoms.contiguous(),
+        n_max,
+    )
+
+
 def eval_bivariate_poly(
     x: torch.Tensor,
     y: torch.Tensor,

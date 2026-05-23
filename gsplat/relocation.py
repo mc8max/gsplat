@@ -57,8 +57,16 @@ def compute_relocation(
     scales = scales.contiguous()
     ratios.clamp_(min=1, max=n_max)
     ratios = ratios.int().contiguous()
+    binoms = binoms.contiguous()
 
-    new_opacities, new_scales = _make_lazy_cuda_func("relocation")(
-        opacities, scales, ratios, binoms, n_max
-    )
+    if opacities.device.type == "mps":
+        from .metal._wrapper import relocation as metal_relocation
+
+        new_opacities, new_scales = metal_relocation(
+            opacities, scales, ratios, binoms, n_max
+        )
+    else:
+        new_opacities, new_scales = _make_lazy_cuda_func("relocation")(
+            opacities, scales, ratios, binoms, n_max
+        )
     return new_opacities, new_scales

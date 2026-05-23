@@ -22,6 +22,7 @@
 #include "ops/rasterize_to_pixels_from_world_3dgs.h"
 #include "ops/rasterize_to_indices_3dgs.h"
 #include "ops/rasterize_to_indices_2dgs.h"
+#include "ops/relocation.h"
 #include "ops/spherical_harmonics.h"
 #include "ops/sort_int64.h"
 
@@ -46,6 +47,10 @@ TORCH_LIBRARY_FRAGMENT(gsplat, m) {
         "Tensor(a!) param, Tensor param_grad, Tensor(b!) exp_avg, Tensor(c!) exp_avg_sq, "
         "Tensor? valid, float lr, float b1, float b2, float eps"
         ") -> ()");
+    m.def(
+        "metal_relocation("
+        "Tensor opacities, Tensor scales, Tensor ratios, Tensor binoms, int n_max"
+        ") -> (Tensor, Tensor)");
     m.def(
         "metal_quat_scale_to_covar_preci_fwd("
         "Tensor quats, Tensor scales, bool compute_covar, bool compute_preci, bool triu"
@@ -240,6 +245,7 @@ TORCH_LIBRARY_FRAGMENT(gsplat, m) {
 
 TORCH_LIBRARY_IMPL(gsplat, MPS, m) {
     m.impl("metal_adam", &adam_op);
+    m.impl("metal_relocation", &relocation_op);
     m.impl("metal_eval_bivariate_poly", &eval_bivariate_poly_op);
     m.impl("metal_distort_camera_rays", &distort_camera_rays_op);
     m.impl("metal_intersect_offset", &intersect_offset_op);
