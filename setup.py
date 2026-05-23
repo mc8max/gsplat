@@ -30,8 +30,10 @@ exec(open("gsplat/version.py", "r").read())
 
 URL = "https://github.com/nerfstudio-project/gsplat"
 
-BUILD_NO_CUDA = os.getenv("BUILD_NO_CUDA", "0") == "1"
 _is_apple_silicon = sys.platform == "darwin" and platform.machine() == "arm64"
+_has_cuda_toolkit = bool(os.getenv("CUDA_HOME")) or shutil.which("nvcc") is not None
+_default_build_no_cuda = "1" if _is_apple_silicon or not _has_cuda_toolkit else "0"
+BUILD_NO_CUDA = os.getenv("BUILD_NO_CUDA", _default_build_no_cuda) == "1"
 BUILD_METAL = os.getenv("BUILD_METAL", "1" if _is_apple_silicon else "0") == "1"
 
 
