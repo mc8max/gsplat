@@ -7,6 +7,7 @@ from gsplat._camera_types import RollingShutterType
 
 from ._backend import has_metal
 from ._wrapper import (
+    adam,
     distort_camera_rays,
     eval_bivariate_poly,
     fully_fused_projection,
@@ -32,6 +33,7 @@ isect_offset_encode = intersect_offset_encode
 isect_tiles = intersect_tiles
 
 __all__ = [
+    "adam",
     "distort_camera_rays",
     "eval_bivariate_poly",
     "fully_fused_projection",

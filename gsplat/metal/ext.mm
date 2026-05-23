@@ -4,6 +4,7 @@
 #include <torch/extension.h>
 
 #include "MetalContext.h"
+#include "ops/adam.h"
 #include "ops/external_distortion.h"
 #include "ops/intersect_offset.h"
 #include "ops/intersect_tile.h"
@@ -40,6 +41,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
 TORCH_LIBRARY_FRAGMENT(gsplat, m) {
     m.def("metal_null(Tensor self) -> Tensor");
+    m.def(
+        "metal_adam("
+        "Tensor(a!) param, Tensor param_grad, Tensor(b!) exp_avg, Tensor(c!) exp_avg_sq, "
+        "Tensor? valid, float lr, float b1, float b2, float eps"
+        ") -> ()");
     m.def(
         "metal_quat_scale_to_covar_preci_fwd("
         "Tensor quats, Tensor scales, bool compute_covar, bool compute_preci, bool triu"
@@ -233,6 +239,7 @@ TORCH_LIBRARY_FRAGMENT(gsplat, m) {
 }
 
 TORCH_LIBRARY_IMPL(gsplat, MPS, m) {
+    m.impl("metal_adam", &adam_op);
     m.impl("metal_eval_bivariate_poly", &eval_bivariate_poly_op);
     m.impl("metal_distort_camera_rays", &distort_camera_rays_op);
     m.impl("metal_intersect_offset", &intersect_offset_op);

@@ -65,6 +65,81 @@ def metal_null(x: torch.Tensor) -> torch.Tensor:
     return _make_lazy_metal_func("metal_null")(x)
 
 
+def adam(
+    param: torch.Tensor,
+    param_grad: torch.Tensor,
+    exp_avg: torch.Tensor,
+    exp_avg_sq: torch.Tensor,
+    valid: Optional[torch.Tensor],
+    lr: float,
+    b1: float,
+    b2: float,
+    eps: float,
+) -> None:
+    """Fused Adam update on MPS for float32/float16 tensors."""
+
+    def _prepare_mutable_tensor(tensor: torch.Tensor, name: str) -> tuple[torch.Tensor, bool]:
+        if tensor.device != param.device:
+            raise ValueError(f"{name} must be on the same device as param, got {tensor.device} and {param.device}")
+        if tensor.dtype != param.dtype:
+            raise ValueError(f"{name} must have the same dtype as param, got {tensor.dtype} and {param.dtype}")
+        needs_copy_back = not tensor.is_contiguous()
+        return (tensor.contiguous() if needs_copy_back else tensor, needs_copy_back)
+
+    if param.device.type != "mps":
+        raise ValueError(f"param must be on MPS, got {param.device}")
+    if param.dtype not in (torch.float32, torch.float16):
+        raise ValueError(f"param must be float32 or float16, got {param.dtype}")
+    if param.dim() < 1:
+        raise ValueError(f"param must have at least one dimension, got {tuple(param.shape)}")
+    if param.shape != param_grad.shape:
+        raise ValueError(f"param and param_grad must have the same shape, got {param.shape} and {param_grad.shape}")
+    if param.shape != exp_avg.shape:
+        raise ValueError(f"param and exp_avg must have the same shape, got {param.shape} and {exp_avg.shape}")
+    if param.shape != exp_avg_sq.shape:
+        raise ValueError(
+            f"param and exp_avg_sq must have the same shape, got {param.shape} and {exp_avg_sq.shape}"
+        )
+
+    param_arg, copy_param_back = _prepare_mutable_tensor(param, "param")
+    param_grad_arg, _ = _prepare_mutable_tensor(param_grad, "param_grad")
+    exp_avg_arg, copy_exp_avg_back = _prepare_mutable_tensor(exp_avg, "exp_avg")
+    exp_avg_sq_arg, copy_exp_avg_sq_back = _prepare_mutable_tensor(exp_avg_sq, "exp_avg_sq")
+
+    valid_arg = None
+    if valid is not None:
+        if valid.device.type != "mps":
+            raise ValueError(f"valid must be on MPS, got {valid.device}")
+        if valid.dtype != torch.bool:
+            raise ValueError(f"valid must be bool, got {valid.dtype}")
+        if valid.dim() != 1:
+            raise ValueError(f"valid must be 1D, got {tuple(valid.shape)}")
+        if valid.shape[0] != param.shape[0]:
+            raise ValueError(
+                f"valid first dimension must match param first dimension, got {valid.shape[0]} and {param.shape[0]}"
+            )
+        valid_arg = valid.contiguous()
+
+    _make_lazy_metal_func("metal_adam")(
+        param_arg,
+        param_grad_arg,
+        exp_avg_arg,
+        exp_avg_sq_arg,
+        valid_arg,
+        float(lr),
+        float(b1),
+        float(b2),
+        float(eps),
+    )
+
+    if copy_param_back:
+        param.copy_(param_arg)
+    if copy_exp_avg_back:
+        exp_avg.copy_(exp_avg_arg)
+    if copy_exp_avg_sq_back:
+        exp_avg_sq.copy_(exp_avg_sq_arg)
+
+
 def eval_bivariate_poly(
     x: torch.Tensor,
     y: torch.Tensor,
