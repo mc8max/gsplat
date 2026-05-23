@@ -14,6 +14,7 @@
 #include "ops/projection_2dgs_fused.h"
 #include "ops/projection_2dgs_packed.h"
 #include "ops/projection_ewa_simple.h"
+#include "ops/projection_ut_3dgs_fused.h"
 #include "ops/quat_scale_to_covar_preci.h"
 #include "ops/rasterize_to_pixels_2dgs.h"
 #include "ops/rasterize_to_pixels_3dgs.h"
@@ -131,6 +132,19 @@ TORCH_LIBRARY_FRAGMENT(gsplat, m) {
         "Tensor v_means2d, Tensor v_covars2d"
         ") -> (Tensor, Tensor)");
     m.def(
+        "metal_projection_ut_3dgs_fused("
+        "Tensor means, Tensor quats, Tensor scales, Tensor? opacities, Tensor viewmats0, Tensor? viewmats1, Tensor pose_start, Tensor? pose_end, Tensor Ks, "
+        "Tensor? radial_coeffs, Tensor? tangential_coeffs, Tensor? thin_prism_coeffs, Tensor? fisheye_max_angle, "
+        "Tensor? ftheta_pixeldist_to_angle_poly, Tensor? ftheta_angle_to_pixeldist_poly, "
+        "Tensor? ftheta_dreference_poly, Tensor? ftheta_linear_cde, Tensor? ftheta_max_angle, "
+        "Tensor? external_h_poly, Tensor? external_v_poly, "
+        "float lidar_fov_horiz_start, float lidar_fov_horiz_span, float lidar_fov_vert_start, float lidar_fov_vert_span, float lidar_fov_eps, int lidar_spinning_direction, "
+        "int image_width, int image_height, float eps2d, float near_plane, float far_plane, "
+        "float radius_clip, bool calc_compensations, int camera_model, bool global_z_order, "
+        "float ut_alpha, float ut_beta, float ut_kappa, float ut_in_image_margin_factor, "
+        "bool ut_require_all_sigma_points_valid, int rolling_shutter, int ftheta_reference_poly, int external_h_order, int external_v_order"
+        ") -> (Tensor, Tensor, Tensor, Tensor, Tensor)");
+    m.def(
         "metal_intersect_offset("
         "Tensor isect_ids, int I, int tile_width, int tile_height"
         ") -> Tensor");
@@ -236,6 +250,7 @@ TORCH_LIBRARY_IMPL(gsplat, MPS, m) {
     m.impl("metal_projection_ewa_3dgs_fused_bwd", &projection_ewa_3dgs_fused_bwd_op);
     m.impl("metal_projection_ewa_simple_fwd", &projection_ewa_simple_fwd_op);
     m.impl("metal_projection_ewa_simple_bwd", &projection_ewa_simple_bwd_op);
+    m.impl("metal_projection_ut_3dgs_fused", &projection_ut_3dgs_fused_op);
     m.impl("metal_rasterize_to_pixels_2dgs_fwd", &rasterize_to_pixels_2dgs_fwd_op);
     m.impl("metal_rasterize_to_pixels_2dgs_bwd", &rasterize_to_pixels_2dgs_bwd_op);
     m.impl("metal_rasterize_to_pixels_3dgs_fwd", &rasterize_to_pixels_3dgs_fwd_op);

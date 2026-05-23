@@ -18,6 +18,7 @@ from gsplat._camera_types import (
     RollingShutterType,
     RowOffsetStructuredSpinningLidarModelParametersExt,
     UnscentedTransformParameters,
+    viewmat_to_pose,
 )
 
 from ._backend import load
@@ -701,6 +702,8 @@ _CAMERA_MODEL_TO_INT = {
     "ortho": 1,
     "fisheye": 2,
 }
+
+_UT_CAMERA_MODELS = {"pinhole": 0, "fisheye": 2, "ftheta": 3, "lidar": 4}
 
 
 def _sparse_coo_grad(indices: torch.Tensor, values: torch.Tensor, size, *, is_coalesced: bool):
@@ -1678,6 +1681,323 @@ def fully_fused_projection(
         camera_model,
         opacities,
     )
+
+
+def fully_fused_projection_with_ut(
+    means: torch.Tensor,
+    quats: torch.Tensor,
+    scales: torch.Tensor,
+    opacities: Optional[torch.Tensor],
+    viewmats: torch.Tensor,
+    Ks: torch.Tensor,
+    width: int,
+    height: int,
+    eps2d: float = 0.3,
+    near_plane: float = 0.01,
+    far_plane: float = 1e10,
+    radius_clip: float = 0.0,
+    calc_compensations: bool = False,
+    camera_model: CameraModel = "pinhole",
+    ut_params: Optional[UnscentedTransformParameters] = None,
+    radial_coeffs: Optional[torch.Tensor] = None,
+    tangential_coeffs: Optional[torch.Tensor] = None,
+    thin_prism_coeffs: Optional[torch.Tensor] = None,
+    ftheta_coeffs: Optional[FThetaCameraDistortionParameters] = None,
+    lidar_coeffs: Optional[RowOffsetStructuredSpinningLidarModelParametersExt] = None,
+    external_distortion_coeffs: Optional[BivariateWindshieldModelParameters] = None,
+    rolling_shutter: RollingShutterType = RollingShutterType.GLOBAL,
+    viewmats_rs: Optional[torch.Tensor] = None,
+    global_z_order: bool = True,
+):
+    """Project world-space 3DGS Gaussians with UT support on MPS."""
+
+    if ut_params is None:
+        ut_params = UnscentedTransformParameters()
+
+    if means.device.type != "mps":
+        raise ValueError(f"means must be on MPS, got {means.device}")
+    if means.dtype != torch.float32:
+        raise ValueError(f"means must be float32, got {means.dtype}")
+    if camera_model not in _UT_CAMERA_MODELS:
+        raise ValueError(
+            f"camera_model must be one of {tuple(_UT_CAMERA_MODELS)}, got {camera_model}"
+        )
+    if camera_model not in ("pinhole", "fisheye", "ftheta", "lidar"):
+        raise NotImplementedError(
+            "Metal UT projection only supports camera_model in {'pinhole', 'fisheye', 'ftheta', 'lidar'}"
+        )
+
+    batch_dims = means.shape[:-2]
+    N = means.shape[-2]
+    C = viewmats.shape[-3]
+    if means.shape != batch_dims + (N, 3):
+        raise ValueError(f"means must have shape {batch_dims + (N, 3)}, got {means.shape}")
+    if quats.shape != batch_dims + (N, 4):
+        raise ValueError(f"quats must have shape {batch_dims + (N, 4)}, got {quats.shape}")
+    if scales.shape != batch_dims + (N, 3):
+        raise ValueError(f"scales must have shape {batch_dims + (N, 3)}, got {scales.shape}")
+    if viewmats.shape != batch_dims + (C, 4, 4):
+        raise ValueError(f"viewmats must have shape {batch_dims + (C, 4, 4)}, got {viewmats.shape}")
+    if Ks.shape != batch_dims + (C, 3, 3):
+        raise ValueError(f"Ks must have shape {batch_dims + (C, 3, 3)}, got {Ks.shape}")
+    if quats.device != means.device or scales.device != means.device:
+        raise ValueError("quats and scales must be on the same device as means")
+    if viewmats.device != means.device or Ks.device != means.device:
+        raise ValueError("viewmats and Ks must be on the same device as means")
+    if quats.dtype != torch.float32 or scales.dtype != torch.float32:
+        raise ValueError("quats and scales must be float32")
+    if viewmats.dtype != torch.float32 or Ks.dtype != torch.float32:
+        raise ValueError("viewmats and Ks must be float32")
+    if rolling_shutter != RollingShutterType.GLOBAL and viewmats_rs is None:
+        raise ValueError("viewmats_rs is required when rolling_shutter is not GLOBAL")
+    if viewmats_rs is not None:
+        if viewmats_rs.device != means.device or viewmats_rs.dtype != torch.float32:
+            raise ValueError("viewmats_rs must be float32 on the same device as means")
+        if viewmats_rs.shape != batch_dims + (C, 4, 4):
+            raise ValueError(f"viewmats_rs must have shape {batch_dims + (C, 4, 4)}, got {viewmats_rs.shape}")
+        viewmats_rs = viewmats_rs.contiguous()
+    if opacities is not None:
+        if opacities.device != means.device or opacities.dtype != torch.float32:
+            raise ValueError("opacities must be float32 on the same device as means")
+        if opacities.shape != batch_dims + (N,):
+            raise ValueError(f"opacities must have shape {batch_dims + (N,)}, got {opacities.shape}")
+        opacities = opacities.contiguous()
+
+    radial_coeffs_prepared = None
+    tangential_coeffs_prepared = None
+    thin_prism_coeffs_prepared = None
+    fisheye_max_angle = None
+    ftheta_pixeldist_to_angle_poly = None
+    ftheta_angle_to_pixeldist_poly = None
+    ftheta_dreference_poly = None
+    ftheta_linear_cde = None
+    ftheta_max_angle = None
+    ftheta_reference_poly = 0
+    external_h_poly = None
+    external_v_poly = None
+    external_h_order = 0
+    external_v_order = 0
+    lidar_fov_horiz_start = 0.0
+    lidar_fov_horiz_span = 0.0
+    lidar_fov_vert_start = 0.0
+    lidar_fov_vert_span = 0.0
+    lidar_fov_eps = 0.0
+    lidar_spinning_direction = 0
+    pose_start = None
+    pose_end = None
+    image_dims = batch_dims + (C,)
+    if camera_model == "pinhole":
+        if lidar_coeffs is not None:
+            raise NotImplementedError("Metal pinhole UT projection does not support lidar coefficients")
+        if ftheta_coeffs is not None:
+            raise NotImplementedError("Metal pinhole UT projection does not support ftheta coefficients")
+        if radial_coeffs is not None:
+            if radial_coeffs.device != means.device or radial_coeffs.dtype != torch.float32:
+                raise ValueError("radial_coeffs must be float32 on the same device as means")
+            if radial_coeffs.shape[:-1] != image_dims or radial_coeffs.shape[-1] not in (4, 6):
+                raise ValueError(
+                    f"radial_coeffs must have shape {image_dims + (4,)} or {image_dims + (6,)}, got {radial_coeffs.shape}"
+                )
+            if radial_coeffs.shape[-1] == 4:
+                radial_coeffs_prepared = torch.nn.functional.pad(radial_coeffs, (0, 2)).contiguous()
+            else:
+                radial_coeffs_prepared = radial_coeffs.contiguous()
+        if tangential_coeffs is not None:
+            if tangential_coeffs.device != means.device or tangential_coeffs.dtype != torch.float32:
+                raise ValueError("tangential_coeffs must be float32 on the same device as means")
+            if tangential_coeffs.shape != image_dims + (2,):
+                raise ValueError(
+                    f"tangential_coeffs must have shape {image_dims + (2,)}, got {tangential_coeffs.shape}"
+                )
+            tangential_coeffs_prepared = tangential_coeffs.contiguous()
+        if thin_prism_coeffs is not None:
+            if thin_prism_coeffs.device != means.device or thin_prism_coeffs.dtype != torch.float32:
+                raise ValueError("thin_prism_coeffs must be float32 on the same device as means")
+            if thin_prism_coeffs.shape != image_dims + (4,):
+                raise ValueError(
+                    f"thin_prism_coeffs must have shape {image_dims + (4,)}, got {thin_prism_coeffs.shape}"
+                )
+            thin_prism_coeffs_prepared = thin_prism_coeffs.contiguous()
+    elif camera_model == "fisheye":
+        if lidar_coeffs is not None:
+            raise NotImplementedError("Metal fisheye UT projection does not support lidar coefficients")
+        if tangential_coeffs is not None or thin_prism_coeffs is not None:
+            raise NotImplementedError("Metal Phase 2 fisheye UT projection does not support tangential or thin-prism coefficients")
+        if radial_coeffs is not None:
+            if radial_coeffs.device != means.device or radial_coeffs.dtype != torch.float32:
+                raise ValueError("radial_coeffs must be float32 on the same device as means")
+            if radial_coeffs.shape != image_dims + (4,):
+                raise ValueError(
+                    f"radial_coeffs must have shape {image_dims + (4,)}, got {radial_coeffs.shape}"
+                )
+            radial_coeffs_prepared = radial_coeffs.contiguous()
+        from gsplat.cuda._torch_cameras import _BaseCameraModel
+
+        focal_lengths = torch.stack([Ks[..., 0, 0], Ks[..., 1, 1]], dim=-1)
+        principal_points = Ks[..., :2, 2]
+        fisheye_camera = _BaseCameraModel.create(
+            width=width,
+            height=height,
+            camera_model="fisheye",
+            principal_points=principal_points,
+            focal_lengths=focal_lengths,
+            radial_coeffs=radial_coeffs_prepared,
+            rs_type=RollingShutterType.GLOBAL,
+        )
+        fisheye_max_angle = fisheye_camera.max_angle.contiguous()
+    elif camera_model == "ftheta":
+        if lidar_coeffs is not None:
+            raise NotImplementedError("Metal ftheta UT projection does not support lidar coefficients")
+        if radial_coeffs is not None or tangential_coeffs is not None or thin_prism_coeffs is not None:
+            raise NotImplementedError("Metal ftheta UT projection does not support radial, tangential, or thin-prism coefficients")
+        if ftheta_coeffs is None:
+            raise ValueError("ftheta requires ftheta_coeffs")
+        from gsplat._camera_types import FThetaPolynomialType
+
+        pixeldist_to_angle_poly = torch.tensor(
+            ftheta_coeffs.pixeldist_to_angle_poly,
+            device=means.device,
+            dtype=means.dtype,
+        )
+        angle_to_pixeldist_poly = torch.tensor(
+            ftheta_coeffs.angle_to_pixeldist_poly,
+            device=means.device,
+            dtype=means.dtype,
+        )
+        if ftheta_coeffs.reference_poly == FThetaPolynomialType.PIXELDIST_TO_ANGLE:
+            dreference_coeffs = torch.tensor(
+                [
+                    1.0 * ftheta_coeffs.pixeldist_to_angle_poly[1],
+                    2.0 * ftheta_coeffs.pixeldist_to_angle_poly[2],
+                    3.0 * ftheta_coeffs.pixeldist_to_angle_poly[3],
+                    4.0 * ftheta_coeffs.pixeldist_to_angle_poly[4],
+                    5.0 * ftheta_coeffs.pixeldist_to_angle_poly[5],
+                ],
+                device=means.device,
+                dtype=means.dtype,
+            )
+        else:
+            dreference_coeffs = torch.tensor(
+                [
+                    1.0 * ftheta_coeffs.angle_to_pixeldist_poly[1],
+                    2.0 * ftheta_coeffs.angle_to_pixeldist_poly[2],
+                    3.0 * ftheta_coeffs.angle_to_pixeldist_poly[3],
+                    4.0 * ftheta_coeffs.angle_to_pixeldist_poly[4],
+                    5.0 * ftheta_coeffs.angle_to_pixeldist_poly[5],
+                ],
+                device=means.device,
+                dtype=means.dtype,
+            )
+        ftheta_pixeldist_to_angle_poly = pixeldist_to_angle_poly.contiguous()
+        ftheta_angle_to_pixeldist_poly = angle_to_pixeldist_poly.contiguous()
+        ftheta_dreference_poly = dreference_coeffs.contiguous()
+        ftheta_linear_cde = torch.tensor(
+            ftheta_coeffs.linear_cde,
+            device=means.device,
+            dtype=means.dtype,
+        ).contiguous()
+        ftheta_max_angle = torch.tensor(
+            [ftheta_coeffs.max_angle],
+            device=means.device,
+            dtype=means.dtype,
+        ).contiguous()
+        ftheta_reference_poly = int(ftheta_coeffs.reference_poly)
+    else:
+        if lidar_coeffs is None:
+            raise ValueError("lidar requires lidar_coeffs")
+        if ftheta_coeffs is not None:
+            raise NotImplementedError("Metal lidar UT projection does not support ftheta coefficients")
+        if radial_coeffs is not None or tangential_coeffs is not None or thin_prism_coeffs is not None:
+            raise NotImplementedError("Metal lidar UT projection does not support camera distortion coefficients")
+        if external_distortion_coeffs is not None:
+            raise NotImplementedError("Metal lidar UT projection does not support external distortion")
+        if rolling_shutter != RollingShutterType.GLOBAL or viewmats_rs is not None:
+            raise NotImplementedError("Metal lidar UT projection only supports global shutter")
+        if width != lidar_coeffs.n_columns or height != lidar_coeffs.n_rows:
+            raise ValueError(
+                f"lidar width/height must match lidar_coeffs ({lidar_coeffs.n_columns}, {lidar_coeffs.n_rows}), got {(width, height)}"
+            )
+        if lidar_coeffs.row_elevations_rad.device != means.device or lidar_coeffs.row_elevations_rad.dtype != torch.float32:
+            raise ValueError("lidar_coeffs tensors must be float32 on the same device as means")
+        if lidar_coeffs.column_azimuths_rad.device != means.device or lidar_coeffs.column_azimuths_rad.dtype != torch.float32:
+            raise ValueError("lidar_coeffs tensors must be float32 on the same device as means")
+        if lidar_coeffs.row_azimuth_offsets_rad.device != means.device or lidar_coeffs.row_azimuth_offsets_rad.dtype != torch.float32:
+            raise ValueError("lidar_coeffs tensors must be float32 on the same device as means")
+        lidar_fov_horiz_start = float(lidar_coeffs.fov_horiz_rad.start)
+        lidar_fov_horiz_span = float(lidar_coeffs.fov_horiz_rad.span)
+        lidar_fov_vert_start = float(lidar_coeffs.fov_vert_rad.start)
+        lidar_fov_vert_span = float(lidar_coeffs.fov_vert_rad.span)
+        lidar_fov_eps = float(lidar_coeffs.fov_eps_rad)
+        lidar_spinning_direction = int(lidar_coeffs.spinning_direction.value)
+
+    if external_distortion_coeffs is not None:
+        horizontal_poly = external_distortion_coeffs.horizontal_poly
+        vertical_poly = external_distortion_coeffs.vertical_poly
+        if horizontal_poly is None or vertical_poly is None:
+            raise ValueError("external_distortion_coeffs requires horizontal_poly and vertical_poly")
+        external_h_poly = horizontal_poly.to(device=means.device, dtype=means.dtype).contiguous()
+        external_v_poly = vertical_poly.to(device=means.device, dtype=means.dtype).contiguous()
+        external_h_order = int((math.isqrt(1 + 8 * external_h_poly.numel()) - 3) // 2)
+        external_v_order = int((math.isqrt(1 + 8 * external_v_poly.numel()) - 3) // 2)
+        if (external_h_order + 1) * (external_h_order + 2) // 2 != external_h_poly.numel():
+            raise ValueError("external_distortion horizontal_poly has invalid triangular coefficient count")
+        if (external_v_order + 1) * (external_v_order + 2) // 2 != external_v_poly.numel():
+            raise ValueError("external_distortion vertical_poly has invalid triangular coefficient count")
+
+    pose_start = viewmat_to_pose(viewmats).contiguous()
+    pose_end = viewmat_to_pose(viewmats_rs).contiguous() if viewmats_rs is not None else None
+
+    radii, means2d, depths, conics, compensations = _make_lazy_metal_func(
+        "metal_projection_ut_3dgs_fused"
+    )(
+        means.contiguous(),
+        quats.contiguous(),
+        scales.contiguous(),
+        opacities,
+        viewmats.contiguous(),
+        viewmats_rs,
+        pose_start,
+        pose_end,
+        Ks.contiguous(),
+        radial_coeffs_prepared,
+        tangential_coeffs_prepared,
+        thin_prism_coeffs_prepared,
+        fisheye_max_angle,
+        ftheta_pixeldist_to_angle_poly,
+        ftheta_angle_to_pixeldist_poly,
+        ftheta_dreference_poly,
+        ftheta_linear_cde,
+        ftheta_max_angle,
+        external_h_poly,
+        external_v_poly,
+        lidar_fov_horiz_start,
+        lidar_fov_horiz_span,
+        lidar_fov_vert_start,
+        lidar_fov_vert_span,
+        lidar_fov_eps,
+        lidar_spinning_direction,
+        width,
+        height,
+        eps2d,
+        near_plane,
+        far_plane,
+        radius_clip,
+        calc_compensations,
+        _UT_CAMERA_MODELS[camera_model],
+        global_z_order,
+        ut_params.alpha,
+        ut_params.beta,
+        ut_params.kappa,
+        ut_params.in_image_margin_factor,
+        ut_params.require_all_sigma_points_valid,
+        int(rolling_shutter),
+        ftheta_reference_poly,
+        external_h_order,
+        external_v_order,
+    )
+    if not calc_compensations:
+        compensations = None
+    return radii, means2d, depths, conics, compensations
 
 
 def fully_fused_projection_2dgs(

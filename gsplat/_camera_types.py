@@ -12,6 +12,8 @@ from typing import ClassVar, Sequence
 import torch
 from typing_extensions import Literal
 
+from gsplat._helper import assert_shape
+from gsplat.cuda._math import _rotmat_to_quat
 from gsplat.cuda._lidar import (
     FOV as FOVBase,
     RowOffsetStructuredSpinningLidarModelParametersExt as RowOffsetStructuredSpinningLidarModelParametersExtBase,
@@ -111,6 +113,21 @@ class RowOffsetStructuredSpinningLidarModelParametersExt(
     """Lidar camera parameters extended with acceleration structures."""
 
 
+def viewmat_to_pose(viewmat: torch.Tensor) -> torch.Tensor:
+    """Convert a 4x4 world-to-camera matrix to [tx, ty, tz, qw, qx, qy, qz]."""
+
+    batch_dims = viewmat.shape[:-2]
+    assert_shape("viewmat", viewmat, batch_dims + (4, 4))
+
+    rotation = viewmat[..., :3, :3]
+    translation = viewmat[..., :3, 3]
+    quaternion = _rotmat_to_quat(rotation)
+    result = torch.cat([translation, quaternion], dim=-1)
+
+    assert_shape("result", result, batch_dims + (7,))
+    return result
+
+
 __all__ = [
     "BivariateWindshieldModelParameters",
     "CameraModel",
@@ -123,4 +140,5 @@ __all__ = [
     "RollingShutterType",
     "RowOffsetStructuredSpinningLidarModelParametersExt",
     "UnscentedTransformParameters",
+    "viewmat_to_pose",
 ]
