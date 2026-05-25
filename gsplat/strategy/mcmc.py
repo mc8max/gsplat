@@ -156,7 +156,8 @@ class MCMCStrategy(Strategy):
                     f"Now having {len(params['means'])} GSs."
                 )
 
-            torch.cuda.empty_cache()
+            if params["means"].device.type == "cuda":
+                torch.cuda.empty_cache()
 
         # add noise to GSs (stop after noise_injection_stop_iter if set)
         noise_stop = (
