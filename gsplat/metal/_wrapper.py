@@ -2644,6 +2644,15 @@ class _RasterizeToPixels(torch.autograd.Function):
         backgrounds = backgrounds if ctx.has_backgrounds else None
         masks = masks if ctx.has_masks else None
 
+        if v_render_colors is None:
+            v_render_colors = torch.zeros(
+                render_alphas.shape[:-1] + (colors.shape[-1],),
+                device=render_alphas.device,
+                dtype=render_alphas.dtype,
+            )
+        if v_render_alphas is None:
+            v_render_alphas = torch.zeros_like(render_alphas)
+
         (
             v_means2d_abs,
             v_means2d,
