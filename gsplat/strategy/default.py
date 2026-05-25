@@ -205,7 +205,8 @@ class DefaultStrategy(Strategy):
             state["count"].zero_()
             if self.refine_scale2d_stop_iter > 0:
                 state["radii"].zero_()
-            torch.cuda.empty_cache()
+            if params["means"].device.type == "cuda":
+                torch.cuda.empty_cache()
 
         if step % self.reset_every == 0 and step > 0:
             reset_opa(

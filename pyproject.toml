@@ -36,11 +36,36 @@ dependencies = [
     "rich>=12",
     "torch",
     "typing_extensions; python_version<'3.8'",
+    "matplotlib>=3.10.9",
+    "imageio[ffmpeg]>=2.37.3"
 ]
 
 [project.optional-dependencies]
 lidar = [
     "scipy",
+]
+examples = [
+    "tqdm",
+    "tyro>=0.8.8",
+    "pyyaml>=6.0.1",
+    "tensorboard",
+    "torchmetrics[image]",
+    "opencv-python",
+    "Pillow",
+    "piexif",
+    "scipy",
+    "scikit-learn",
+    "pycolmap @ git+https://github.com/rmbrualla/pycolmap.git",
+    "viser",
+]
+compression = [
+    "PLAS @ git+https://github.com/fraunhoferhhi/PLAS.git ; platform_system != 'Darwin'",
+    "torchpq>=0.3.0.6 ; platform_system != 'Darwin'",
+    "cupy ; platform_system != 'Darwin'",
+]
+cuda = [
+    "cupy ; platform_system != 'Darwin'",
+    "nerfacc>=0.5.3 ; platform_system != 'Darwin'",
 ]
 dev = [
     "black[jupyter]==22.3.0",
@@ -53,11 +78,7 @@ dev = [
     "pyyaml>=6.0.1",
     "build",
     "twine",
-    "cupy",
-    "nerfacc>=0.5.3",
-    "PLAS @ git+https://github.com/fraunhoferhhi/PLAS.git",
-    "imageio>=2.37.2",
-    "torchpq>=0.3.0.6",
+    "imageio[ffmpeg]>=2.37.3",
 ]
 
 [tool.setuptools.dynamic]
@@ -83,7 +104,18 @@ gsplat-metal = [
     "pyyaml>=6.0.1",
     "build",
     "twine",
-    "imageio>=2.37.2",
+    "imageio[ffmpeg]>=2.37.3",
+    "tqdm",
+    "tyro>=0.8.8",
+    "tensorboard",
+    "torchmetrics[image]",
+    "opencv-python",
+    "Pillow",
+    "piexif",
+    "scipy",
+    "scikit-learn",
+    "pycolmap @ git+https://github.com/rmbrualla/pycolmap.git",
+    "viser",
 ]
 
 [tool.uv]

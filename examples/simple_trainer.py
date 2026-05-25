@@ -17,11 +17,12 @@
 import json
 import math
 import os
+import sys
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING, Union
 
 import imageio
 import numpy as np
@@ -29,33 +30,94 @@ import torch
 import torch.nn.functional as F
 import tqdm
 import tyro
-import viser
 import yaml
+
+EXAMPLES_DIR = Path(__file__).resolve().parent
+if str(EXAMPLES_DIR) not in sys.path:
+    sys.path.insert(0, str(EXAMPLES_DIR))
+
 from gsplat.color_correct import color_correct_affine, color_correct_quadratic
-from datasets.colmap import Dataset, Parser
 from datasets.traj import (
     generate_ellipse_path_z,
     generate_interpolated_path,
     generate_spiral_path,
 )
-from fused_ssim import fused_ssim
 from torch import Tensor
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.tensorboard import SummaryWriter
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from typing_extensions import Literal, assert_never
-from utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_random_seed
+from utils import (
+    AppearanceOptModule,
+    CameraOptModule,
+    apply_float_colormap,
+    knn,
+    rgb_to_sh,
+    set_random_seed,
+)
 
-from gsplat import export_splats
+from gsplat import CameraModel, export_splats
 from gsplat.compression import PngCompression
 from gsplat.distributed import cli
 from gsplat.optimizers import SelectiveAdam
 from gsplat.rendering import rasterization, RasterizeMode
-from gsplat.cuda._wrapper import CameraModel
 from gsplat.strategy import DefaultStrategy, MCMCStrategy
-from gsplat_viewer import GsplatViewer, GsplatRenderTabState
-from nerfview import CameraState, RenderTabState, apply_float_colormap
+try:
+    from fused_ssim import fused_ssim
+except ImportError:
+    fused_ssim = None
+
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except ImportError:
+    SummaryWriter = None
+
+if TYPE_CHECKING:
+    import viser
+    from gsplat_viewer import GsplatRenderTabState, GsplatViewer
+    from nerfview import CameraState, RenderTabState
+
+
+class _NullSummaryWriter:
+    def add_scalar(self, *args, **kwargs):
+        return None
+
+    def add_image(self, *args, **kwargs):
+        return None
+
+    def flush(self):
+        return None
+
+
+def _resolve_device(requested_device: str, local_rank: int) -> torch.device:
+    if requested_device == "auto":
+        if torch.cuda.is_available():
+            requested_device = "cuda"
+        elif torch.backends.mps.is_available():
+            requested_device = "mps"
+        else:
+            raise RuntimeError("Neither CUDA nor MPS is available for training.")
+
+    if requested_device == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA was requested but is not available.")
+        return torch.device(f"cuda:{local_rank}")
+    if requested_device == "mps":
+        if not torch.backends.mps.is_available():
+            raise RuntimeError("MPS was requested but is not available.")
+        return torch.device("mps")
+    raise ValueError(f"Unsupported device: {requested_device}")
+
+
+def _max_memory_allocated_gib(device: torch.device) -> float:
+    if device.type != "cuda":
+        return 0.0
+    return torch.cuda.max_memory_allocated(device=device) / 1024**3
+
+
+def _synchronize_device(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize(device=device)
 
 
 @dataclass
@@ -111,6 +173,8 @@ class Config:
 
     # Port for the viewer server
     port: int = 8080
+    # Device/backend preference for training.
+    device: Literal["auto", "cuda", "mps"] = "auto"
 
     # Batch size for training. Learning rates are scaled automatically
     batch_size: int = 1
@@ -263,7 +327,7 @@ class Config:
 
 
 def create_splats_with_optimizers(
-    parser: Parser,
+    parser: Any,
     init_type: str = "sfm",
     init_num_pts: int = 100_000,
     init_extent: float = 3.0,
@@ -342,13 +406,18 @@ def create_splats_with_optimizers(
         optimizer_class = SelectiveAdam
     else:
         optimizer_class = torch.optim.Adam
+    optimizer_common_kwargs = {
+        "eps": 1e-15 / math.sqrt(BS),
+        # TODO: check betas logic when BS is larger than 10 betas[0] will be zero.
+        "betas": (1 - BS * (1 - 0.9), 1 - BS * (1 - 0.999)),
+    }
+    if optimizer_class is torch.optim.Adam and str(device).startswith("cuda"):
+        optimizer_common_kwargs["fused"] = True
+
     optimizers = {
         name: optimizer_class(
             [{"params": splats[name], "lr": lr * math.sqrt(BS), "name": name}],
-            eps=1e-15 / math.sqrt(BS),
-            # TODO: check betas logic when BS is larger than 10 betas[0] will be zero.
-            betas=(1 - BS * (1 - 0.9), 1 - BS * (1 - 0.999)),
-            fused=True,
+            **optimizer_common_kwargs,
         )
         for name, _, lr in params
     }
@@ -367,7 +436,9 @@ class Runner:
         self.world_rank = world_rank
         self.local_rank = local_rank
         self.world_size = world_size
-        self.device = f"cuda:{local_rank}"
+        self.device = _resolve_device(cfg.device, local_rank)
+        if self.device.type != "cuda" and world_size > 1:
+            raise ValueError("Only single-process training is supported on non-CUDA devices.")
 
         # Where to dump results.
         os.makedirs(cfg.result_dir, exist_ok=True)
@@ -383,7 +454,10 @@ class Runner:
         os.makedirs(self.ply_dir, exist_ok=True)
 
         # Tensorboard
-        self.writer = SummaryWriter(log_dir=f"{cfg.result_dir}/tb")
+        if SummaryWriter is None:
+            self.writer = _NullSummaryWriter()
+        else:
+            self.writer = SummaryWriter(log_dir=f"{cfg.result_dir}/tb")
 
         # Load data: Training data should contain initial points and colors.
         if cfg.data_type == "ncore":
@@ -418,6 +492,8 @@ class Runner:
                     "[NCore] Warning: FTheta cameras detected; pass --with-eval3d True for correct results."
                 )
         else:
+            from datasets.colmap import Dataset, Parser
+
             self.parser = Parser(
                 data_dir=cfg.data_dir,
                 factor=cfg.data_factor,
@@ -453,6 +529,12 @@ class Runner:
             raise ValueError(
                 f"PPISP post-processing requires MCMCStrategy at the moment."
             )
+        if self.device.type != "cuda" and cfg.post_processing is not None:
+            raise ValueError("Post-processing is currently only supported in the CUDA trainer path.")
+        if self.device.type != "cuda" and cfg.visible_adam and cfg.sparse_grad:
+            raise ValueError("visible_adam and sparse_grad cannot be enabled together.")
+        if self.device.type != "cuda" and not cfg.disable_viewer:
+            raise ValueError("Viewer mode is currently only supported in the CUDA trainer path. Pass --disable-viewer True.")
 
         # Model
         feature_dim = 32 if cfg.app_opt else None
@@ -581,6 +663,11 @@ class Runner:
 
         # Losses & Metrics.
         self.ssim = StructuralSimilarityIndexMeasure(data_range=1.0).to(self.device)
+        self.train_ssim = (
+            None
+            if fused_ssim is not None
+            else StructuralSimilarityIndexMeasure(data_range=1.0).to(self.device)
+        )
         self.psnr = PeakSignalNoiseRatio(data_range=1.0).to(self.device)
 
         if cfg.lpips_net == "alex":
@@ -597,6 +684,9 @@ class Runner:
 
         # Viewer
         if not self.cfg.disable_viewer:
+            import viser
+            from gsplat_viewer import GsplatViewer
+
             self.server = viser.ViserServer(port=cfg.port, verbose=False)
             self.viewer = GsplatViewer(
                 server=self.server,
@@ -819,7 +909,7 @@ class Runner:
             shuffle=True,
             num_workers=4,
             persistent_workers=True,
-            pin_memory=True,
+            pin_memory=self.device.type == "cuda",
         )
         trainloader_iter = iter(trainloader)
 
@@ -919,11 +1009,17 @@ class Runner:
                 l1loss = F.l1_loss(colors, pixels)
                 colors_ssim = colors
                 pixels_ssim = pixels
-            ssimloss = 1.0 - fused_ssim(
-                colors_ssim.permute(0, 3, 1, 2),
-                pixels_ssim.permute(0, 3, 1, 2),
-                padding="valid",
-            )
+            if fused_ssim is not None:
+                ssimloss = 1.0 - fused_ssim(
+                    colors_ssim.permute(0, 3, 1, 2),
+                    pixels_ssim.permute(0, 3, 1, 2),
+                    padding="valid",
+                )
+            else:
+                ssimloss = 1.0 - self.train_ssim(
+                    colors_ssim.permute(0, 3, 1, 2),
+                    pixels_ssim.permute(0, 3, 1, 2),
+                )
             loss = torch.lerp(l1loss, ssimloss, cfg.ssim_lambda)
             if cfg.depth_loss:
                 # query depths from depth map
@@ -982,7 +1078,7 @@ class Runner:
             #     )
 
             if world_rank == 0 and cfg.tb_every > 0 and step % cfg.tb_every == 0:
-                mem = torch.cuda.max_memory_allocated() / 1024**3
+                mem = _max_memory_allocated_gib(self.device)
                 self.writer.add_scalar("train/loss", loss.item(), step)
                 self.writer.add_scalar("train/l1loss", l1loss.item(), step)
                 self.writer.add_scalar("train/ssimloss", ssimloss.item(), step)
@@ -1004,7 +1100,7 @@ class Runner:
 
             # save checkpoint before updating the model
             if step in [i - 1 for i in cfg.save_steps] or step == max_steps - 1:
-                mem = torch.cuda.max_memory_allocated() / 1024**3
+                mem = _max_memory_allocated_gib(self.device)
                 stats = {
                     "mem": mem,
                     "ellipse_time": time.time() - global_tic,
@@ -1179,7 +1275,7 @@ class Runner:
             # Exposure metadata is available for any image with EXIF data (train or val)
             exposure = data["exposure"].to(device) if "exposure" in data else None
 
-            torch.cuda.synchronize()
+            _synchronize_device(self.device)
             tic = time.time()
             colors, _, _ = self.rasterize_splats(
                 camtoworlds=camtoworlds,
@@ -1194,7 +1290,7 @@ class Runner:
                 camera_idcs=data["camera_idx"].to(device),
                 exposure=exposure,
             )  # [1, H, W, 3]
-            torch.cuda.synchronize()
+            _synchronize_device(self.device)
             ellipse_time += max(time.time() - tic, 1e-10)
 
             colors = torch.clamp(colors, 0.0, 1.0)
@@ -1383,9 +1479,8 @@ class Runner:
 
     @torch.no_grad()
     def _viewer_render_fn(
-        self, camera_state: CameraState, render_tab_state: RenderTabState
+        self, camera_state: Any, render_tab_state: Any
     ):
-        assert isinstance(render_tab_state, GsplatRenderTabState)
         if render_tab_state.preview_render:
             width = render_tab_state.render_width
             height = render_tab_state.render_height
@@ -1481,6 +1576,8 @@ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
         cfg.disable_viewer = True
         if world_rank == 0:
             print("Viewer is disabled in distributed training.")
+    if world_size > 1 and cfg.device != "cuda":
+        raise ValueError("Distributed training is currently only supported in the CUDA trainer path.")
 
     runner = Runner(local_rank, world_rank, world_size, cfg)
 
@@ -1565,4 +1662,7 @@ if __name__ == "__main__":
             "DefaultStrategy is incompatible with eval3d; use MCMCStrategy (the `mcmc` subcommand)."
         )
 
-    cli(main, cfg, verbose=True)
+    if cfg.device == "cuda" or (cfg.device == "auto" and torch.cuda.is_available()):
+        cli(main, cfg, verbose=True)
+    else:
+        main(0, 0, 1, cfg)

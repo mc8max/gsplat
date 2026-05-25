@@ -131,6 +131,17 @@ setup(
         "lidar": [
             "scipy",
         ],
+        # CUDA-only runtime helpers. Install them by `pip install gsplat[cuda]`
+        "cuda": [
+            "cupy ; platform_system != 'Darwin'",
+            "nerfacc>=0.5.3 ; platform_system != 'Darwin'",
+        ],
+        # Compression helpers. Install them by `pip install gsplat[compression]`
+        "compression": [
+            "PLAS @ git+https://github.com/fraunhoferhhi/PLAS.git ; platform_system != 'Darwin'",
+            "torchpq>=0.3.0.6 ; platform_system != 'Darwin'",
+            "cupy ; platform_system != 'Darwin'",
+        ],
         # dev dependencies. Install them by `pip install gsplat[dev]`
         "dev": [
             "black[jupyter]==22.3.0",
@@ -143,11 +154,7 @@ setup(
             "pyyaml>=6.0.1",
             "build",
             "twine",
-            "cupy",
-            "nerfacc>=0.5.3",
-            "PLAS @ git+https://github.com/fraunhoferhhi/PLAS.git",
             "imageio>=2.37.2",
-            "torchpq>=0.3.0.6",
         ],
     },
     ext_modules=ext_modules,

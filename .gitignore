@@ -128,5 +128,6 @@ results
 !examples/benchmarks/compression/results/
 
 local/
+notebooks/
 *.metallib
 *.air
