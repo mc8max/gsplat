@@ -34,6 +34,23 @@ inline float reduce_sum_threadgroup(
     return scratch[0];
 }
 
+inline float4 reduce_sum_threadgroup4(
+    float4 value,
+    threadgroup float4* scratch,
+    uint local_idx,
+    uint block_size
+) {
+    scratch[local_idx] = value;
+    for (uint s = block_size >> 1; s > 0u; s >>= 1) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (local_idx < s) {
+            scratch[local_idx] += scratch[local_idx + s];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    return scratch[0];
+}
+
 kernel void rasterize_to_pixels_3dgs_fwd_kernel(
     device const float* means2d [[buffer(0)]],
     device const float* conics [[buffer(1)]],
@@ -258,6 +275,7 @@ kernel void rasterize_to_pixels_3dgs_bwd_kernel(
     threadgroup float3 conic_batch[kMaxBlockSize];
     threadgroup float color_batch[kMaxBlockSize * kCachedChannels];
     threadgroup float reduce_scratch[kMaxBlockSize];
+    threadgroup float4 reduce_scratch4[kMaxBlockSize];
 
     const float px = float(j) + 0.5f;
     const float py = float(i) + 0.5f;
@@ -382,39 +400,33 @@ kernel void rasterize_to_pixels_3dgs_bwd_kernel(
 
             // tmp_* buffers are pre-zeroed by at::zeros in the launcher;
             // no per-slot zeroing is needed here.
-            const float sum_conic_x = reduce_sum_threadgroup(v_conic_x, reduce_scratch, local_idx, block_size);
+            const float4 sum_conic_opacity = reduce_sum_threadgroup4(
+                float4(v_conic_x, v_conic_y, v_conic_z, v_opacity),
+                reduce_scratch4,
+                local_idx,
+                block_size
+            );
             if (local_idx == 0u) {
-                tmp_conics[3 * uint(isect_idx)] = sum_conic_x;
+                tmp_conics[3 * uint(isect_idx)] = sum_conic_opacity.x;
+                tmp_conics[3 * uint(isect_idx) + 1u] = sum_conic_opacity.y;
+                tmp_conics[3 * uint(isect_idx) + 2u] = sum_conic_opacity.z;
+                tmp_opacities[uint(isect_idx)] = sum_conic_opacity.w;
             }
-            const float sum_conic_y = reduce_sum_threadgroup(v_conic_y, reduce_scratch, local_idx, block_size);
+            const float4 sum_xy_abs = reduce_sum_threadgroup4(
+                float4(v_xy_x, v_xy_y, v_xy_abs_x, v_xy_abs_y),
+                reduce_scratch4,
+                local_idx,
+                block_size
+            );
             if (local_idx == 0u) {
-                tmp_conics[3 * uint(isect_idx) + 1u] = sum_conic_y;
-            }
-            const float sum_conic_z = reduce_sum_threadgroup(v_conic_z, reduce_scratch, local_idx, block_size);
-            if (local_idx == 0u) {
-                tmp_conics[3 * uint(isect_idx) + 2u] = sum_conic_z;
-            }
-            const float sum_xy_x = reduce_sum_threadgroup(v_xy_x, reduce_scratch, local_idx, block_size);
-            if (local_idx == 0u) {
-                tmp_means2d[2 * uint(isect_idx)] = sum_xy_x;
-            }
-            const float sum_xy_y = reduce_sum_threadgroup(v_xy_y, reduce_scratch, local_idx, block_size);
-            if (local_idx == 0u) {
-                tmp_means2d[2 * uint(isect_idx) + 1u] = sum_xy_y;
+                tmp_means2d[2 * uint(isect_idx)] = sum_xy_abs.x;
+                tmp_means2d[2 * uint(isect_idx) + 1u] = sum_xy_abs.y;
             }
             if (tmp_means2d_abs != nullptr) {
-                const float sum_xy_abs_x = reduce_sum_threadgroup(v_xy_abs_x, reduce_scratch, local_idx, block_size);
                 if (local_idx == 0u) {
-                    tmp_means2d_abs[2 * uint(isect_idx)] = sum_xy_abs_x;
+                    tmp_means2d_abs[2 * uint(isect_idx)] = sum_xy_abs.z;
+                    tmp_means2d_abs[2 * uint(isect_idx) + 1u] = sum_xy_abs.w;
                 }
-                const float sum_xy_abs_y = reduce_sum_threadgroup(v_xy_abs_y, reduce_scratch, local_idx, block_size);
-                if (local_idx == 0u) {
-                    tmp_means2d_abs[2 * uint(isect_idx) + 1u] = sum_xy_abs_y;
-                }
-            }
-            const float sum_opacity = reduce_sum_threadgroup(v_opacity, reduce_scratch, local_idx, block_size);
-            if (local_idx == 0u) {
-                tmp_opacities[uint(isect_idx)] = sum_opacity;
             }
 
             const uint grad_base = pixel_flat * channels;
