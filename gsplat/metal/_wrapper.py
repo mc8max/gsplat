@@ -255,13 +255,6 @@ def _synthesize_eval3d_world_rays(
     rolling_shutter: RollingShutterType = RollingShutterType.GLOBAL,
     viewmats_rs: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    from gsplat.cuda._torch_cameras import (
-        _BaseCameraModel,
-        _interpolate_shutter_pose,
-        _pose_camera_ray_to_world_ray,
-        _viewmat_to_pose,
-    )
-
     batch_dims = viewmats.shape[:-3]
     c = viewmats.shape[-3]
     flat_count = math.prod(batch_dims) * c
@@ -270,6 +263,68 @@ def _synthesize_eval3d_world_rays(
 
     viewmats_flat = viewmats.reshape(flat_count, 4, 4)
     Ks_flat = Ks.reshape(flat_count, 3, 3)
+
+    # Fast path for the common pinhole/global-shutter case used by current Metal
+    # eval3d workloads. This avoids the generic camera-model machinery and builds
+    # world rays directly from the view matrix and intrinsics.
+    if (
+        camera_model == "pinhole"
+        and radial_coeffs is None
+        and tangential_coeffs is None
+        and thin_prism_coeffs is None
+        and ftheta_coeffs is None
+        and external_distortion_coeffs is None
+        and rolling_shutter == RollingShutterType.GLOBAL
+        and viewmats_rs is None
+    ):
+        grid_x = torch.arange(width, device=device, dtype=dtype).view(1, 1, width) + 0.5
+        grid_y = torch.arange(height, device=device, dtype=dtype).view(1, height, 1) + 0.5
+
+        fx = Ks_flat[:, 0, 0].view(flat_count, 1, 1)
+        fy = Ks_flat[:, 1, 1].view(flat_count, 1, 1)
+        cx = Ks_flat[:, 0, 2].view(flat_count, 1, 1)
+        cy = Ks_flat[:, 1, 2].view(flat_count, 1, 1)
+        cam_x = (grid_x - cx) / fx
+        cam_y = (grid_y - cy) / fy
+
+        r00 = viewmats_flat[:, 0, 0].view(flat_count, 1, 1)
+        r01 = viewmats_flat[:, 0, 1].view(flat_count, 1, 1)
+        r02 = viewmats_flat[:, 0, 2].view(flat_count, 1, 1)
+        tx = viewmats_flat[:, 0, 3].view(flat_count, 1, 1)
+        r10 = viewmats_flat[:, 1, 0].view(flat_count, 1, 1)
+        r11 = viewmats_flat[:, 1, 1].view(flat_count, 1, 1)
+        r12 = viewmats_flat[:, 1, 2].view(flat_count, 1, 1)
+        ty = viewmats_flat[:, 1, 3].view(flat_count, 1, 1)
+        r20 = viewmats_flat[:, 2, 0].view(flat_count, 1, 1)
+        r21 = viewmats_flat[:, 2, 1].view(flat_count, 1, 1)
+        r22 = viewmats_flat[:, 2, 2].view(flat_count, 1, 1)
+        tz = viewmats_flat[:, 2, 3].view(flat_count, 1, 1)
+
+        ray_o = torch.stack(
+            [
+                -(r00 * tx + r10 * ty + r20 * tz),
+                -(r01 * tx + r11 * ty + r21 * tz),
+                -(r02 * tx + r12 * ty + r22 * tz),
+            ],
+            dim=-1,
+        ).expand(-1, height, width, -1)
+        ray_d = torch.stack(
+            [
+                r00 * cam_x + r10 * cam_y + r20,
+                r01 * cam_x + r11 * cam_y + r21,
+                r02 * cam_x + r12 * cam_y + r22,
+            ],
+            dim=-1,
+        )
+        rays = torch.cat([ray_o, ray_d], dim=-1)
+        return rays.reshape(batch_dims + (c, height, width, 6))
+
+    from gsplat._torch_cameras import (
+        _BaseCameraModel,
+        _interpolate_shutter_pose,
+        _pose_camera_ray_to_world_ray,
+    )
+
     focal_lengths = torch.stack([Ks_flat[:, 0, 0], Ks_flat[:, 1, 1]], dim=-1)
     principal_points = torch.stack([Ks_flat[:, 0, 2], Ks_flat[:, 1, 2]], dim=-1)
 
@@ -304,8 +359,8 @@ def _synthesize_eval3d_world_rays(
             True,
         ).reshape(flat_count, height * width, 3)
 
-    pose_start = _viewmat_to_pose(viewmats_flat)
-    pose_end = _viewmat_to_pose(
+    pose_start = viewmat_to_pose(viewmats_flat)
+    pose_end = viewmat_to_pose(
         (viewmats_rs if viewmats_rs is not None else viewmats).reshape(flat_count, 4, 4)
     )
     relative_time = camera.shutter_relative_frame_time(image_points)
@@ -1961,7 +2016,7 @@ def fully_fused_projection_with_ut(
                     f"radial_coeffs must have shape {image_dims + (4,)}, got {radial_coeffs.shape}"
                 )
             radial_coeffs_prepared = radial_coeffs.contiguous()
-        from gsplat.cuda._torch_cameras import _BaseCameraModel
+        from gsplat._torch_cameras import _BaseCameraModel
 
         focal_lengths = torch.stack([Ks[..., 0, 0], Ks[..., 1, 1]], dim=-1)
         principal_points = Ks[..., :2, 2]

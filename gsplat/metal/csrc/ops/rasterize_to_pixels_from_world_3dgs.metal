@@ -30,6 +30,17 @@ struct RasterizeFromWorldKernelConfig {
     uint image_height;
 };
 
+struct CachedRayCameraParams {
+    float3 ray_o;
+    float3 dir_dx;
+    float3 dir_dy;
+    float3 dir_bias;
+    float cam_x_scale;
+    float cam_x_bias;
+    float cam_y_scale;
+    float cam_y_bias;
+};
+
 inline float reduce_sum_threadgroup(
     float value,
     threadgroup float* scratch,
@@ -145,6 +156,59 @@ inline void load_or_generate_ray_metal(
     );
 }
 
+inline void load_cached_ray_camera_params_metal(
+    device const float* viewmats,
+    device const float* Ks,
+    uint image_id,
+    threadgroup CachedRayCameraParams& cache
+) {
+    const uint viewmat_base = image_id * 16u;
+    const float r00 = viewmats[viewmat_base + 0u];
+    const float r01 = viewmats[viewmat_base + 1u];
+    const float r02 = viewmats[viewmat_base + 2u];
+    const float tx = viewmats[viewmat_base + 3u];
+    const float r10 = viewmats[viewmat_base + 4u];
+    const float r11 = viewmats[viewmat_base + 5u];
+    const float r12 = viewmats[viewmat_base + 6u];
+    const float ty = viewmats[viewmat_base + 7u];
+    const float r20 = viewmats[viewmat_base + 8u];
+    const float r21 = viewmats[viewmat_base + 9u];
+    const float r22 = viewmats[viewmat_base + 10u];
+    const float tz = viewmats[viewmat_base + 11u];
+
+    const uint K_base = image_id * 9u;
+    const float fx = Ks[K_base + 0u];
+    const float fy = Ks[K_base + 4u];
+    const float cx = Ks[K_base + 2u];
+    const float cy = Ks[K_base + 5u];
+
+    cache.ray_o = float3(
+        -(r00 * tx + r10 * ty + r20 * tz),
+        -(r01 * tx + r11 * ty + r21 * tz),
+        -(r02 * tx + r12 * ty + r22 * tz)
+    );
+    cache.dir_dx = float3(r00, r01, r02);
+    cache.dir_dy = float3(r10, r11, r12);
+    cache.dir_bias = float3(r20, r21, r22);
+    cache.cam_x_scale = 1.0f / fx;
+    cache.cam_x_bias = (0.5f - cx) * cache.cam_x_scale;
+    cache.cam_y_scale = 1.0f / fy;
+    cache.cam_y_bias = (0.5f - cy) * cache.cam_y_scale;
+}
+
+inline void generate_cached_ray_metal(
+    threadgroup const CachedRayCameraParams& cache,
+    uint pixel_y,
+    uint pixel_x,
+    thread float3& ray_o,
+    thread float3& ray_d
+) {
+    const float cam_x = float(pixel_x) * cache.cam_x_scale + cache.cam_x_bias;
+    const float cam_y = float(pixel_y) * cache.cam_y_scale + cache.cam_y_bias;
+    ray_o = cache.ray_o;
+    ray_d = cache.dir_dx * cam_x + cache.dir_dy * cam_y + cache.dir_bias;
+}
+
 inline void quat_scale_to_preci_half_vjp_metal(
     float4 quat,
     float3 scale,
@@ -244,6 +308,7 @@ kernel void rasterize_to_pixels_from_world_3dgs_fwd_kernel(
     threadgroup float4 xyz_opacity_batch[kMaxBlockSize];
     threadgroup float3 scale_batch[kMaxBlockSize];
     threadgroup float4 quat_batch[kMaxBlockSize];
+    threadgroup CachedRayCameraParams ray_camera_cache;
 
     float T = 1.0f;
     int cur_idx = -1;
@@ -257,10 +322,20 @@ kernel void rasterize_to_pixels_from_world_3dgs_fwd_kernel(
     const bool return_normals = render_normals != nullptr;
     float3 ray_o = float3(0.0f);
     float3 ray_d = float3(0.0f);
+    if (rays == nullptr) {
+        if (local_idx == 0u) {
+            load_cached_ray_camera_params_metal(viewmats, Ks, image_id, ray_camera_cache);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
     if (inside) {
-        load_or_generate_ray_metal(
-            viewmats, Ks, rays, cfg, image_id, i, j, ray_o, ray_d
-        );
+        if (rays != nullptr) {
+            load_or_generate_ray_metal(
+                viewmats, Ks, rays, cfg, image_id, i, j, ray_o, ray_d
+            );
+        } else {
+            generate_cached_ray_metal(ray_camera_cache, i, j, ray_o, ray_d);
+        }
     }
 
     for (int batch_start = range_start; batch_start < range_end; batch_start += int(block_size)) {
@@ -446,6 +521,7 @@ kernel void rasterize_to_pixels_from_world_3dgs_bwd_kernel(
     threadgroup float4 quat_batch[kMaxBlockSize];
     threadgroup float reduce_scratch[kMaxBlockSize];
     threadgroup float4 reduce_scratch4[kMaxBlockSize];
+    threadgroup CachedRayCameraParams ray_camera_cache;
 
     const float T_final = inside ? (1.0f - render_alphas[pixel_flat]) : 1.0f;
     float T = T_final;
@@ -474,9 +550,17 @@ kernel void rasterize_to_pixels_from_world_3dgs_bwd_kernel(
     const uint clamped_j = min(j, cfg.image_width - 1u);
     float3 ray_o;
     float3 ray_d;
-    load_or_generate_ray_metal(
-        viewmats, Ks, rays, cfg, image_id, clamped_i, clamped_j, ray_o, ray_d
-    );
+    if (rays == nullptr) {
+        if (local_idx == 0u) {
+            load_cached_ray_camera_params_metal(viewmats, Ks, image_id, ray_camera_cache);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        generate_cached_ray_metal(ray_camera_cache, clamped_i, clamped_j, ray_o, ray_d);
+    } else {
+        load_or_generate_ray_metal(
+            viewmats, Ks, rays, cfg, image_id, clamped_i, clamped_j, ray_o, ray_d
+        );
+    }
     float3 v_ray_o = float3(0.0f);
     float3 v_ray_d = float3(0.0f);
 
