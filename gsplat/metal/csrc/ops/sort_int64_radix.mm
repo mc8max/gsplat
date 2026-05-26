@@ -127,7 +127,7 @@ void compute_block_offsets(
     at::Tensor offsets_cpu = at::from_blob(
         offsets.data(),
         {static_cast<int64_t>(num_blocks * kRadixBuckets)},
-        at::TensorOptions().dtype(at::kInt));
+        at::TensorOptions().dtype(at::kInt)).clone();
     block_offsets_mps.copy_(offsets_cpu);
 }
 
