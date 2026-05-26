@@ -47,6 +47,23 @@ inline float reduce_sum_threadgroup(
     return scratch[0];
 }
 
+inline float4 reduce_sum_threadgroup4(
+    float4 value,
+    threadgroup float4* scratch,
+    uint local_idx,
+    uint block_size
+) {
+    scratch[local_idx] = value;
+    for (uint s = block_size >> 1; s > 0u; s >>= 1) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (local_idx < s) {
+            scratch[local_idx] += scratch[local_idx + s];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    return scratch[0];
+}
+
 inline float3 safe_normalize_metal(float3 v) {
     const float l = dot(v, v);
     return l > 0.0f ? v * rsqrt(l) : v;
@@ -238,6 +255,13 @@ kernel void rasterize_to_pixels_from_world_3dgs_fwd_kernel(
     }
     float3 normal_out = float3(0.0f);
     const bool return_normals = render_normals != nullptr;
+    float3 ray_o = float3(0.0f);
+    float3 ray_d = float3(0.0f);
+    if (inside) {
+        load_or_generate_ray_metal(
+            viewmats, Ks, rays, cfg, image_id, i, j, ray_o, ray_d
+        );
+    }
 
     for (int batch_start = range_start; batch_start < range_end; batch_start += int(block_size)) {
         const int idx = batch_start + int(local_idx);
@@ -276,12 +300,6 @@ kernel void rasterize_to_pixels_from_world_3dgs_fwd_kernel(
             const float3 xyz = xyz_opac.xyz;
             const float3 scale = scale_batch[t];
             const float4 quat = quat_batch[t];
-
-            float3 ray_o;
-            float3 ray_d;
-            load_or_generate_ray_metal(
-                viewmats, Ks, rays, cfg, image_id, i, j, ray_o, ray_d
-            );
 
             const float3x3 R = quat_to_rotmat(quat);
             const float3x3 S = float3x3(
@@ -427,6 +445,7 @@ kernel void rasterize_to_pixels_from_world_3dgs_bwd_kernel(
     threadgroup float3 scale_batch[kMaxBlockSize];
     threadgroup float4 quat_batch[kMaxBlockSize];
     threadgroup float reduce_scratch[kMaxBlockSize];
+    threadgroup float4 reduce_scratch4[kMaxBlockSize];
 
     const float T_final = inside ? (1.0f - render_alphas[pixel_flat]) : 1.0f;
     float T = T_final;
@@ -657,52 +676,33 @@ kernel void rasterize_to_pixels_from_world_3dgs_bwd_kernel(
                 }
             }
 
-            const float sum_mean_x = reduce_sum_threadgroup(v_mean_local.x, reduce_scratch, local_idx, block_size);
+            const float4 sum_mean_opacity = reduce_sum_threadgroup4(
+                float4(v_mean_local, v_opacity_local), reduce_scratch4, local_idx, block_size
+            );
             if (local_idx == 0u) {
-                tmp_means[3 * uint(isect_idx) + 0u] = sum_mean_x;
-            }
-            const float sum_mean_y = reduce_sum_threadgroup(v_mean_local.y, reduce_scratch, local_idx, block_size);
-            if (local_idx == 0u) {
-                tmp_means[3 * uint(isect_idx) + 1u] = sum_mean_y;
-            }
-            const float sum_mean_z = reduce_sum_threadgroup(v_mean_local.z, reduce_scratch, local_idx, block_size);
-            if (local_idx == 0u) {
-                tmp_means[3 * uint(isect_idx) + 2u] = sum_mean_z;
+                tmp_means[3 * uint(isect_idx) + 0u] = sum_mean_opacity.x;
+                tmp_means[3 * uint(isect_idx) + 1u] = sum_mean_opacity.y;
+                tmp_means[3 * uint(isect_idx) + 2u] = sum_mean_opacity.z;
+                tmp_opacities[uint(isect_idx)] = sum_mean_opacity.w;
             }
 
-            const float sum_scale_x = reduce_sum_threadgroup(v_scale_local.x, reduce_scratch, local_idx, block_size);
+            const float4 sum_scale_pad = reduce_sum_threadgroup4(
+                float4(v_scale_local, 0.0f), reduce_scratch4, local_idx, block_size
+            );
             if (local_idx == 0u) {
-                tmp_scales[3 * uint(isect_idx) + 0u] = sum_scale_x;
-            }
-            const float sum_scale_y = reduce_sum_threadgroup(v_scale_local.y, reduce_scratch, local_idx, block_size);
-            if (local_idx == 0u) {
-                tmp_scales[3 * uint(isect_idx) + 1u] = sum_scale_y;
-            }
-            const float sum_scale_z = reduce_sum_threadgroup(v_scale_local.z, reduce_scratch, local_idx, block_size);
-            if (local_idx == 0u) {
-                tmp_scales[3 * uint(isect_idx) + 2u] = sum_scale_z;
+                tmp_scales[3 * uint(isect_idx) + 0u] = sum_scale_pad.x;
+                tmp_scales[3 * uint(isect_idx) + 1u] = sum_scale_pad.y;
+                tmp_scales[3 * uint(isect_idx) + 2u] = sum_scale_pad.z;
             }
 
-            const float sum_quat_x = reduce_sum_threadgroup(v_quat_local.x, reduce_scratch, local_idx, block_size);
+            const float4 sum_quat = reduce_sum_threadgroup4(
+                v_quat_local, reduce_scratch4, local_idx, block_size
+            );
             if (local_idx == 0u) {
-                tmp_quats[4 * uint(isect_idx) + 0u] = sum_quat_x;
-            }
-            const float sum_quat_y = reduce_sum_threadgroup(v_quat_local.y, reduce_scratch, local_idx, block_size);
-            if (local_idx == 0u) {
-                tmp_quats[4 * uint(isect_idx) + 1u] = sum_quat_y;
-            }
-            const float sum_quat_z = reduce_sum_threadgroup(v_quat_local.z, reduce_scratch, local_idx, block_size);
-            if (local_idx == 0u) {
-                tmp_quats[4 * uint(isect_idx) + 2u] = sum_quat_z;
-            }
-            const float sum_quat_w = reduce_sum_threadgroup(v_quat_local.w, reduce_scratch, local_idx, block_size);
-            if (local_idx == 0u) {
-                tmp_quats[4 * uint(isect_idx) + 3u] = sum_quat_w;
-            }
-
-            const float sum_opacity = reduce_sum_threadgroup(v_opacity_local, reduce_scratch, local_idx, block_size);
-            if (local_idx == 0u) {
-                tmp_opacities[uint(isect_idx)] = sum_opacity;
+                tmp_quats[4 * uint(isect_idx) + 0u] = sum_quat.x;
+                tmp_quats[4 * uint(isect_idx) + 1u] = sum_quat.y;
+                tmp_quats[4 * uint(isect_idx) + 2u] = sum_quat.z;
+                tmp_quats[4 * uint(isect_idx) + 3u] = sum_quat.w;
             }
 
             const uint grad_base = pixel_flat * cfg.channels;
