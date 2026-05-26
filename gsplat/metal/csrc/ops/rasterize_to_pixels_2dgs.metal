@@ -44,6 +44,23 @@ inline float reduce_sum_threadgroup(
     return scratch[0];
 }
 
+inline float4 reduce_sum_threadgroup4(
+    float4 value,
+    threadgroup float4* scratch,
+    uint local_idx,
+    uint block_size
+) {
+    scratch[local_idx] = value;
+    for (uint s = block_size >> 1; s > 0u; s >>= 1) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (local_idx < s) {
+            scratch[local_idx] += scratch[local_idx + s];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    return scratch[0];
+}
+
 kernel void rasterize_to_pixels_2dgs_fwd_kernel(
     device const float* means2d [[buffer(0)]],
     device const float* ray_transforms [[buffer(1)]],
@@ -316,6 +333,7 @@ kernel void rasterize_to_pixels_2dgs_bwd_kernel(
     threadgroup float3 w_batch[kMaxBlockSize];
     threadgroup float3 normal_batch[kMaxBlockSize];
     threadgroup float reduce_scratch[kMaxBlockSize];
+    threadgroup float4 reduce_scratch4[kMaxBlockSize];
 
     const float px = float(j) + 0.5f;
     const float py = float(i) + 0.5f;
@@ -534,78 +552,64 @@ kernel void rasterize_to_pixels_2dgs_bwd_kernel(
                 buffer_normal_z += nrm2.z * fac;
             }
 
-            const float sum_u_x = reduce_sum_threadgroup(v_u_x, reduce_scratch, local_idx, block_size);
+            const float4 sum_u_vx = reduce_sum_threadgroup4(
+                float4(v_u_x, v_u_y, v_u_z, v_v_x),
+                reduce_scratch4,
+                local_idx,
+                block_size
+            );
             if (local_idx == 0u) {
-                tmp_ray_transforms[9 * uint(isect_idx)] = sum_u_x;
+                tmp_ray_transforms[9 * uint(isect_idx)] = sum_u_vx.x;
+                tmp_ray_transforms[9 * uint(isect_idx) + 1u] = sum_u_vx.y;
+                tmp_ray_transforms[9 * uint(isect_idx) + 2u] = sum_u_vx.z;
+                tmp_ray_transforms[9 * uint(isect_idx) + 3u] = sum_u_vx.w;
             }
-            const float sum_u_y = reduce_sum_threadgroup(v_u_y, reduce_scratch, local_idx, block_size);
+            const float4 sum_v_w = reduce_sum_threadgroup4(
+                float4(v_v_y, v_v_z, v_w_x, v_w_y),
+                reduce_scratch4,
+                local_idx,
+                block_size
+            );
             if (local_idx == 0u) {
-                tmp_ray_transforms[9 * uint(isect_idx) + 1u] = sum_u_y;
+                tmp_ray_transforms[9 * uint(isect_idx) + 4u] = sum_v_w.x;
+                tmp_ray_transforms[9 * uint(isect_idx) + 5u] = sum_v_w.y;
+                tmp_ray_transforms[9 * uint(isect_idx) + 6u] = sum_v_w.z;
+                tmp_ray_transforms[9 * uint(isect_idx) + 7u] = sum_v_w.w;
             }
-            const float sum_u_z = reduce_sum_threadgroup(v_u_z, reduce_scratch, local_idx, block_size);
+            const float4 sum_w_xy_opacity = reduce_sum_threadgroup4(
+                float4(v_w_z, v_xy_x, v_xy_y, v_opacity),
+                reduce_scratch4,
+                local_idx,
+                block_size
+            );
             if (local_idx == 0u) {
-                tmp_ray_transforms[9 * uint(isect_idx) + 2u] = sum_u_z;
-            }
-            const float sum_v_x = reduce_sum_threadgroup(v_v_x, reduce_scratch, local_idx, block_size);
-            if (local_idx == 0u) {
-                tmp_ray_transforms[9 * uint(isect_idx) + 3u] = sum_v_x;
-            }
-            const float sum_v_y = reduce_sum_threadgroup(v_v_y, reduce_scratch, local_idx, block_size);
-            if (local_idx == 0u) {
-                tmp_ray_transforms[9 * uint(isect_idx) + 4u] = sum_v_y;
-            }
-            const float sum_v_z = reduce_sum_threadgroup(v_v_z, reduce_scratch, local_idx, block_size);
-            if (local_idx == 0u) {
-                tmp_ray_transforms[9 * uint(isect_idx) + 5u] = sum_v_z;
-            }
-            const float sum_w_x = reduce_sum_threadgroup(v_w_x, reduce_scratch, local_idx, block_size);
-            if (local_idx == 0u) {
-                tmp_ray_transforms[9 * uint(isect_idx) + 6u] = sum_w_x;
-            }
-            const float sum_w_y = reduce_sum_threadgroup(v_w_y, reduce_scratch, local_idx, block_size);
-            if (local_idx == 0u) {
-                tmp_ray_transforms[9 * uint(isect_idx) + 7u] = sum_w_y;
-            }
-            const float sum_w_z = reduce_sum_threadgroup(v_w_z, reduce_scratch, local_idx, block_size);
-            if (local_idx == 0u) {
-                tmp_ray_transforms[9 * uint(isect_idx) + 8u] = sum_w_z;
-            }
-
-            const float sum_xy_x = reduce_sum_threadgroup(v_xy_x, reduce_scratch, local_idx, block_size);
-            if (local_idx == 0u) {
-                tmp_means2d[2 * uint(isect_idx)] = sum_xy_x;
-            }
-            const float sum_xy_y = reduce_sum_threadgroup(v_xy_y, reduce_scratch, local_idx, block_size);
-            if (local_idx == 0u) {
-                tmp_means2d[2 * uint(isect_idx) + 1u] = sum_xy_y;
+                tmp_ray_transforms[9 * uint(isect_idx) + 8u] = sum_w_xy_opacity.x;
+                tmp_means2d[2 * uint(isect_idx)] = sum_w_xy_opacity.y;
+                tmp_means2d[2 * uint(isect_idx) + 1u] = sum_w_xy_opacity.z;
+                tmp_opacities[uint(isect_idx)] = sum_w_xy_opacity.w;
             }
             if (tmp_means2d_abs != nullptr) {
-                const float sum_xy_abs_x = reduce_sum_threadgroup(v_xy_abs_x, reduce_scratch, local_idx, block_size);
+                const float4 sum_xy_abs = reduce_sum_threadgroup4(
+                    float4(v_xy_abs_x, v_xy_abs_y, 0.0f, 0.0f),
+                    reduce_scratch4,
+                    local_idx,
+                    block_size
+                );
                 if (local_idx == 0u) {
-                    tmp_means2d_abs[2 * uint(isect_idx)] = sum_xy_abs_x;
-                }
-                const float sum_xy_abs_y = reduce_sum_threadgroup(v_xy_abs_y, reduce_scratch, local_idx, block_size);
-                if (local_idx == 0u) {
-                    tmp_means2d_abs[2 * uint(isect_idx) + 1u] = sum_xy_abs_y;
+                    tmp_means2d_abs[2 * uint(isect_idx)] = sum_xy_abs.x;
+                    tmp_means2d_abs[2 * uint(isect_idx) + 1u] = sum_xy_abs.y;
                 }
             }
-
-            const float sum_opacity = reduce_sum_threadgroup(v_opacity, reduce_scratch, local_idx, block_size);
+            const float4 sum_normals = reduce_sum_threadgroup4(
+                float4(v_normal_x, v_normal_y, v_normal_z, 0.0f),
+                reduce_scratch4,
+                local_idx,
+                block_size
+            );
             if (local_idx == 0u) {
-                tmp_opacities[uint(isect_idx)] = sum_opacity;
-            }
-
-            const float sum_normal_x = reduce_sum_threadgroup(v_normal_x, reduce_scratch, local_idx, block_size);
-            if (local_idx == 0u) {
-                tmp_normals[3 * uint(isect_idx)] = sum_normal_x;
-            }
-            const float sum_normal_y = reduce_sum_threadgroup(v_normal_y, reduce_scratch, local_idx, block_size);
-            if (local_idx == 0u) {
-                tmp_normals[3 * uint(isect_idx) + 1u] = sum_normal_y;
-            }
-            const float sum_normal_z = reduce_sum_threadgroup(v_normal_z, reduce_scratch, local_idx, block_size);
-            if (local_idx == 0u) {
-                tmp_normals[3 * uint(isect_idx) + 2u] = sum_normal_z;
+                tmp_normals[3 * uint(isect_idx)] = sum_normals.x;
+                tmp_normals[3 * uint(isect_idx) + 1u] = sum_normals.y;
+                tmp_normals[3 * uint(isect_idx) + 2u] = sum_normals.z;
             }
 
             const uint grad_base = pixel_flat * cfg.channels;
