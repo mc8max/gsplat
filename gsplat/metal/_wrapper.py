@@ -798,13 +798,23 @@ def intersect_tile_emit(
 
     if cum_tiles_per_gauss.device != means2d.device:
         raise ValueError("cum_tiles_per_gauss must be on the same device as means2d")
-    if cum_tiles_per_gauss.dtype != torch.int64:
-        raise ValueError(f"cum_tiles_per_gauss must be int64, got {cum_tiles_per_gauss.dtype}")
+    if cum_tiles_per_gauss.dtype not in (torch.int32, torch.int64):
+        raise ValueError(
+            f"cum_tiles_per_gauss must be int32 or int64, got {cum_tiles_per_gauss.dtype}"
+        )
     if cum_tiles_per_gauss.shape != (inputs.n_elements,):
         raise ValueError(
             "cum_tiles_per_gauss must have shape "
             f"({inputs.n_elements},), got {tuple(cum_tiles_per_gauss.shape)}"
         )
+    if cum_tiles_per_gauss.dtype == torch.int64:
+        if cum_tiles_per_gauss.numel() > 0:
+            max_count = int(cum_tiles_per_gauss[-1].item())
+            if max_count > torch.iinfo(torch.int32).max:
+                raise ValueError(
+                    "cum_tiles_per_gauss exceeds int32 range required by the Metal emit kernel"
+                )
+        cum_tiles_per_gauss = cum_tiles_per_gauss.to(dtype=torch.int32)
     return _make_lazy_metal_func("metal_intersect_tile_emit")(
         means2d.contiguous(),
         radii.contiguous(),

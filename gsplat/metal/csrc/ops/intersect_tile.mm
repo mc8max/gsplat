@@ -237,12 +237,12 @@ std::tuple<at::Tensor, at::Tensor> intersect_tile_emit_op(
         tile_height,
         packed,
         segmented);
-    check_mps_int64(cum_tiles_per_gauss, "cum_tiles_per_gauss");
+    check_mps_int32(cum_tiles_per_gauss, "cum_tiles_per_gauss");
     TORCH_CHECK(
         cum_tiles_per_gauss.sizes().equals({static_cast<int64_t>(cfg.n_elements)}),
         "cum_tiles_per_gauss must have shape (n_elements,)");
 
-    const int64_t n_isects = cfg.n_elements == 0u ? 0 : cum_tiles_per_gauss[-1].item<int64_t>();
+    const int64_t n_isects = cfg.n_elements == 0u ? 0 : int64_t(cum_tiles_per_gauss[-1].item<int>());
     at::Tensor isect_ids = at::empty({n_isects}, depths.options().dtype(at::kLong));
     at::Tensor flatten_ids = at::empty({n_isects}, depths.options().dtype(at::kInt));
     if (n_isects == 0) {
@@ -328,15 +328,15 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> intersect_tile_op(
         packed,
         segmented);
 
-    at::Tensor flat_counts = tiles_per_gauss.reshape({-1}).to(at::kLong);
+    at::Tensor flat_counts = tiles_per_gauss.reshape({-1});
     if (flat_counts.numel() == 0) {
         at::Tensor empty_i64 = at::empty({0}, depths.options().dtype(at::kLong));
         at::Tensor empty_i32 = at::empty({0}, depths.options().dtype(at::kInt));
         return std::make_tuple(tiles_per_gauss, empty_i64, empty_i32);
     }
 
-    at::Tensor cum_tiles_per_gauss = at::cumsum(flat_counts, 0);
-    const int64_t n_isects = cum_tiles_per_gauss[-1].item<int64_t>();
+    at::Tensor cum_tiles_per_gauss = at::cumsum(flat_counts, 0, at::kInt);
+    const int64_t n_isects = int64_t(cum_tiles_per_gauss[-1].item<int>());
     if (n_isects == 0) {
         at::Tensor empty_i64 = at::empty({0}, depths.options().dtype(at::kLong));
         at::Tensor empty_i32 = at::empty({0}, depths.options().dtype(at::kInt));

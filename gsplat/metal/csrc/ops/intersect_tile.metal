@@ -259,7 +259,7 @@ kernel void intersect_tile_emit_accutile_kernel(
     device const float* conics [[buffer(3)]],
     device const float* opacities [[buffer(4)]],
     device const long* image_ids [[buffer(5)]],
-    device const long* cum_tiles_per_gauss [[buffer(6)]],
+    device const int* cum_tiles_per_gauss [[buffer(6)]],
     device long* isect_ids [[buffer(7)]],
     device int* flatten_ids [[buffer(8)]],
     constant uint& n_elements [[buffer(9)]],
@@ -289,7 +289,7 @@ kernel void intersect_tile_emit_accutile_kernel(
     // low 32 bits of the final sort key.
     const ulong depth_bits = ulong(as_type<uint>(depths[idx]));
     const ulong upper_prefix = image_id << tile_n_bits;
-    ulong cur_idx = idx == 0u ? 0ul : ulong(cum_tiles_per_gauss[idx - 1u]);
+    ulong cur_idx = idx == 0u ? 0ul : ulong(uint(cum_tiles_per_gauss[idx - 1u]));
 
     const float A = conics[idx * 3];
     const float B = conics[idx * 3 + 1];
@@ -411,7 +411,7 @@ kernel void intersect_tile_emit_aabb_kernel(
     device const float* conics [[buffer(3)]],
     device const float* opacities [[buffer(4)]],
     device const long* image_ids [[buffer(5)]],
-    device const long* cum_tiles_per_gauss [[buffer(6)]],
+    device const int* cum_tiles_per_gauss [[buffer(6)]],
     device long* isect_ids [[buffer(7)]],
     device int* flatten_ids [[buffer(8)]],
     constant uint& n_elements [[buffer(9)]],
@@ -440,7 +440,7 @@ kernel void intersect_tile_emit_aabb_kernel(
     // Keep the raw float depth bits in the low 32 bits for CUDA key parity.
     const ulong depth_bits = ulong(as_type<uint>(depths[idx]));
     const ulong upper_prefix = image_id << tile_n_bits;
-    ulong cur_idx = idx == 0u ? 0ul : ulong(cum_tiles_per_gauss[idx - 1u]);
+    ulong cur_idx = idx == 0u ? 0ul : ulong(uint(cum_tiles_per_gauss[idx - 1u]));
 
     // Convert center and radii from pixel space to tile space.
     const float inv_tile = 1.0f / float(tile_size);
